@@ -34,6 +34,7 @@ from ..commands.rain_command import (
     analyze_precip_nowcast,
     decide_rain_notification,
     fetch_precip_series,
+    format_precip_amount,
     precip_descriptor,
     reverse_geocode_region,
 )
@@ -153,6 +154,9 @@ class WeatherService(BaseServicePlugin):
         self.rain_nowcast_threshold_mm = self.bot.config.getfloat('Weather_Service', 'rain_nowcast_threshold_mm', fallback=0.1)
         # Also announce when rain is about to stop (not just start).
         self.rain_nowcast_announce_ending = self.bot.config.getboolean('Weather_Service', 'rain_nowcast_announce_ending', fallback=True)
+        # Optional precip-amount estimate in the heads-up, e.g. "(est 0.2 in)".
+        self.rain_nowcast_show_amount = self.bot.config.getboolean('Weather_Service', 'rain_nowcast_show_amount', fallback=True)
+        self.rain_nowcast_amount_unit = self.bot.config.get('Weather_Service', 'rain_nowcast_amount_unit', fallback='in').strip().lower()
 
         # Track seen alerts to avoid duplicates
         self.seen_alert_ids: set[str] = set()
@@ -949,12 +953,17 @@ class WeatherService(BaseServicePlugin):
             self._cached_rain_location = (f"{city}, {suffix}" if suffix else city) if city else ""
         location = f" near {self._cached_rain_location}" if self._cached_rain_location else ""
 
+        amt = (
+            format_precip_amount(result.amount_mm, self.rain_nowcast_amount_unit)
+            if self.rain_nowcast_show_amount else None
+        )
+        est = f" (est {amt})" if amt else ""
         if kind == "ending":
-            return f"{emoji} Heads up — {ptype} ending in ~{result.minutes}min{location}"
+            return f"{emoji} Heads up — {ptype} ending in ~{result.minutes}min{est}{location}"
         # Flag prolonged rain ("steady") rather than a numeric duration, which
         # would sit confusingly next to the minutes-until-start value.
         steady = " (steady)" if result.open_ended else ""
-        return f"{emoji} Heads up — {ptype} starting in ~{result.minutes}min{steady}{location}"
+        return f"{emoji} Heads up — {ptype} starting in ~{result.minutes}min{est}{steady}{location}"
 
     async def _connect_blitzortung_mqtt(self) -> None:
         """Connect to Blitzortung MQTT broker and subscribe to lightning data.

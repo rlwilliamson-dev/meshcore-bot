@@ -191,6 +191,23 @@ def precip_descriptor(bucket: Optional[str]) -> tuple[str, str]:
     return _BUCKET_EMOJI.get(b, "🌧️"), _BUCKET_LABEL_EN.get(b, "Rain")
 
 
+def format_precip_amount(mm: Optional[float], unit: str = "in") -> Optional[str]:
+    """Format an accumulated precip total (mm) for display, or None if negligible.
+
+    ``unit`` "in" renders inches (the US default), anything else millimetres.
+    Returns None for a non-positive total so callers can omit the estimate
+    entirely. Inches trim trailing zeros: 0.20 -> "0.2 in", 0.05 -> "0.05 in".
+    """
+    if mm is None or mm <= 0:
+        return None
+    if unit == "mm":
+        return f"{mm:.1f} mm" if mm >= 0.1 else "<0.1 mm"
+    inches = mm * 0.0393701
+    if inches < 0.01:
+        return "<0.01 in"
+    return f"{inches:.2f}".rstrip("0").rstrip(".") + " in"
+
+
 def fetch_precip_series(
     session: Any,
     lat: float,
@@ -283,6 +300,7 @@ class NowcastResult:
     duration_minutes: Optional[int] = None  # for dry_incoming: how long the precip lasts
     open_ended: bool = False                # precip extends past the analysis window
     bucket: Optional[str] = None            # precip bucket (drizzle/rain/snow/...) when raining/incoming
+    amount_mm: Optional[float] = None       # estimated precip total (mm) over the episode within the window
 
 
 def _round5(minutes: float) -> int:
@@ -374,30 +392,43 @@ def analyze_precip_nowcast(
     if raining_now:
         now_code = current_code if current_code is not None else (parsed[cur_idx][2] if cur_idx >= 0 else None)
         bucket = precip_bucket_for_code(now_code) or "rain"
+        # Accumulate the episode total (mm): the current bucket plus each upcoming
+        # bucket until the rain drops below threshold (or the window ends).
+        total = max(0.0, parsed[cur_idx][1]) if cur_idx >= 0 else 0.0
         for mins, amt, _code in upcoming:
             if amt < threshold:
-                return NowcastResult(state="raining_stopping", minutes=_round5(mins), bucket=bucket)
-        return NowcastResult(state="raining_continuing", open_ended=True, bucket=bucket)
+                return NowcastResult(
+                    state="raining_stopping", minutes=_round5(mins), bucket=bucket, amount_mm=total
+                )
+            total += amt
+        return NowcastResult(
+            state="raining_continuing", open_ended=True, bucket=bucket, amount_mm=total
+        )
 
     # Dry now: find the first upcoming precipitating bucket.
     for idx, (mins, amt, code) in enumerate(upcoming):
         if amt >= threshold:
             bucket = precip_bucket_for_code(code) or "rain"
-            # How long does it last? Walk until it drops below threshold.
+            # How long does it last, and how much falls? Walk until it drops below
+            # threshold, summing the episode's buckets for an amount estimate.
+            total = amt
             end_mins: Optional[float] = None
             for mins2, amt2, _c2 in upcoming[idx + 1:]:
                 if amt2 < threshold:
                     end_mins = mins2
                     break
+                total += amt2
             if end_mins is None:
                 return NowcastResult(
-                    state="dry_incoming", minutes=_round5(mins), open_ended=True, bucket=bucket
+                    state="dry_incoming", minutes=_round5(mins), open_ended=True,
+                    bucket=bucket, amount_mm=total,
                 )
             return NowcastResult(
                 state="dry_incoming",
                 minutes=_round5(mins),
                 duration_minutes=_round5(end_mins - mins),
                 bucket=bucket,
+                amount_mm=total,
             )
 
     return NowcastResult(state="dry_clear")
@@ -490,6 +521,14 @@ class RainCommand(BaseCommand):
         self.threshold_mm = self.get_config_value(
             "Rain_Command", "precip_threshold_mm", fallback=0.1, value_type="float"
         )
+        # Optional precip-amount estimate appended to the nowcast line, e.g.
+        # "(est 0.2 in)". Unit "in" (US default) or "mm"; show_amount toggles it.
+        self.show_amount = self.get_config_value(
+            "Rain_Command", "show_amount", fallback=True, value_type="bool"
+        )
+        self.amount_unit = self.bot.config.get(
+            "Rain_Command", "amount_unit", fallback="in"
+        ).strip().lower()
         # Display names. The bot's own location prefers [Weather] default_city +
         # default_state; other coordinates are reverse-geocoded (state for US,
         # country otherwise). Results cached.
@@ -711,6 +750,13 @@ class RainCommand(BaseCommand):
         b = bucket or "rain"
         return self.translate(f"commands.rain.precip_types.{b}")
 
+    def _amount_suffix(self, result: NowcastResult) -> str:
+        """' (est 0.2 in)' for a nowcast result, or '' when off/negligible."""
+        if not self.show_amount:
+            return ""
+        amt = format_precip_amount(result.amount_mm, self.amount_unit)
+        return f" (est {amt})" if amt else ""
+
     def _format_result(self, result: NowcastResult, location_label: str) -> str:
         """Render a NowcastResult into a single mesh-friendly line."""
         emoji = _BUCKET_EMOJI.get(result.bucket or "rain", "🌧️")
@@ -730,7 +776,7 @@ class RainCommand(BaseCommand):
                 minutes=result.minutes,
                 location=location_label,
                 extra=extra,
-            )
+            ) + self._amount_suffix(result)
         if result.state == "raining_stopping":
             return self.translate(
                 "commands.rain.stopping",
@@ -738,7 +784,7 @@ class RainCommand(BaseCommand):
                 ptype=self._ptype(result.bucket),
                 minutes=result.minutes,
                 location=location_label,
-            )
+            ) + self._amount_suffix(result)
         # raining_continuing
         return self.translate(
             "commands.rain.continuing",
@@ -746,7 +792,7 @@ class RainCommand(BaseCommand):
             ptype=self._ptype(result.bucket),
             window=self._window_label(),
             location=location_label,
-        )
+        ) + self._amount_suffix(result)
 
     async def execute(self, message: MeshMessage) -> bool:
         content = message.content.strip()

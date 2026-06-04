@@ -12,6 +12,7 @@ from modules.commands.rain_command import (
     analyze_precip_nowcast,
     city_display_name,
     decide_rain_notification,
+    format_precip_amount,
     precip_bucket_for_code,
     precip_descriptor,
     titlecase_location,
@@ -348,3 +349,68 @@ def test_decide_full_episode_sequence():
         clock += 15 * 60  # advance 15 min between polls
 
     assert kinds == [None, "starting", None, None, "ending", None, None]
+
+
+# --- amount estimate (amount_mm on the result) ------------------------------
+
+def test_amount_dry_incoming_episode_sum():
+    # Rain 14:30 + 14:45 (0.5 each), dry after -> episode total 1.0 mm.
+    precip = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [0, 0, 61, 61, 0, 0, 0, 0, 0]
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, window_minutes=120)
+    assert r.state == "dry_incoming"
+    assert abs(r.amount_mm - 1.0) < 1e-9
+
+
+def test_amount_dry_incoming_open_ended_sums_to_window_edge():
+    # Rain from 14:30 through 16:00 (+120, the window edge): 7 buckets x 0.5.
+    precip = [0.0, 0.0] + [0.5] * 7
+    codes = [0, 0] + [63] * 7
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, window_minutes=120)
+    assert r.state == "dry_incoming"
+    assert r.open_ended is True
+    assert abs(r.amount_mm - 3.5) < 1e-9
+
+
+def test_amount_raining_stopping_includes_current_bucket():
+    # Raining now (0.5) + 14:15 (0.5), clears at 14:30 -> 1.0 mm remaining.
+    precip = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [63, 63, 0, 0, 0, 0, 0, 0, 0]
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, window_minutes=120)
+    assert r.state == "raining_stopping"
+    assert abs(r.amount_mm - 1.0) < 1e-9
+
+
+def test_amount_raining_continuing_sums_current_plus_window():
+    # Steady 0.5 across the current bucket + 8 upcoming -> 4.5 mm over 2h.
+    precip = [0.5] * 9
+    r = analyze_precip_nowcast(TIMES_15, precip, _codes(9, 65), NOW, window_minutes=120)
+    assert r.state == "raining_continuing"
+    assert abs(r.amount_mm - 4.5) < 1e-9
+
+
+def test_amount_dry_clear_is_none():
+    r = analyze_precip_nowcast(TIMES_15, [0.0] * 9, _codes(9, 0), NOW, window_minutes=120)
+    assert r.state == "dry_clear"
+    assert r.amount_mm is None
+
+
+# --- format_precip_amount ---------------------------------------------------
+
+def test_format_amount_inches_trims_zeros():
+    assert format_precip_amount(5.08, "in") == "0.2 in"   # user's example
+    assert format_precip_amount(25.4, "in") == "1 in"      # exact inch
+    assert format_precip_amount(4.5, "in") == "0.18 in"
+
+
+def test_format_amount_inches_trace_and_none():
+    assert format_precip_amount(0.2, "in") == "<0.01 in"   # 0.008 in rounds away
+    assert format_precip_amount(0.0, "in") is None
+    assert format_precip_amount(None, "in") is None
+    assert format_precip_amount(-1.0, "in") is None
+
+
+def test_format_amount_mm_unit():
+    assert format_precip_amount(5.0, "mm") == "5.0 mm"
+    assert format_precip_amount(12.3, "mm") == "12.3 mm"
+    assert format_precip_amount(0.05, "mm") == "<0.1 mm"
