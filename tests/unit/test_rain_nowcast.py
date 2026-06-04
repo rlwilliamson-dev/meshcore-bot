@@ -7,6 +7,8 @@ explicitly, matching how the command derives it from the API's current.time.
 """
 
 from modules.commands.rain_command import (
+    RAIN_FAMILY,
+    SNOW_FAMILY,
     NowcastResult,
     _round5,  # noqa: PLC2701 (testing internal helper)
     analyze_precip_nowcast,
@@ -449,6 +451,48 @@ def test_format_snow_amount():
     assert format_snow_amount(0.0, "in") is None
     assert format_snow_amount(None, "in") is None
     assert format_snow_amount(12.5, "mm") == "12.5 cm snow"   # metric shows cm
+
+
+# --- precip family filter (the !rain vs !snow engine) -----------------------
+
+def test_family_snow_ignores_rain():
+    # Rain incoming, no snow.
+    precip = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [0, 0, 61, 61, 0, 0, 0, 0, 0]
+    assert analyze_precip_nowcast(TIMES_15, precip, codes, NOW, family=SNOW_FAMILY).state == "dry_clear"
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, family=RAIN_FAMILY)
+    assert r.state == "dry_incoming" and r.bucket == "rain"
+
+
+def test_family_rain_ignores_snow():
+    precip = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    snow = [0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [0, 0, 73, 73, 0, 0, 0, 0, 0]
+    assert analyze_precip_nowcast(TIMES_15, precip, codes, NOW, snow=snow, family=RAIN_FAMILY).state == "dry_clear"
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, snow=snow, family=SNOW_FAMILY)
+    assert r.state == "dry_incoming" and r.bucket == "snow"
+
+
+def test_family_smart_hunt_rain_now_snow_later():
+    # Rain at 14:15, then snow at 14:45-15:00. !snow finds the later snow;
+    # !rain finds the sooner rain. (The "smart hunt" the user asked for.)
+    precip = [0.0, 0.5, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0]
+    snow = [0.0, 0.0, 0.0, 3.0, 3.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [0, 61, 0, 73, 73, 0, 0, 0, 0]
+    rsnow = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, snow=snow, family=SNOW_FAMILY)
+    assert rsnow.state == "dry_incoming" and rsnow.bucket == "snow" and rsnow.minutes == 45
+    rrain = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, snow=snow, family=RAIN_FAMILY)
+    assert rrain.state == "dry_incoming" and rrain.bucket == "rain" and rrain.minutes == 15
+
+
+def test_family_none_still_sees_any_precip():
+    # No filter: a snow series is still detected (as the snow bucket).
+    precip = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    snow = [3.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [73, 73, 0, 0, 0, 0, 0, 0, 0]
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, snow=snow,
+                               current_precip=0.5, current_code=73)
+    assert r.state == "raining_stopping" and r.bucket == "snow"
 
 
 # --- join_location (the 'Spain, Spain' dedup) -------------------------------

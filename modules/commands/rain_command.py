@@ -56,6 +56,13 @@ _BUCKET_LABEL_EN: dict[str, str] = {
     "thunder": "Thunderstorms",
 }
 
+# Precip "families" for the !rain vs !snow modes. A command looks for its own
+# family across the window first; only if none is coming does it fall back to
+# the other type with a "No <type>, but ..." heads-up. Freezing rain is liquid,
+# so it lives in the rain family (a !snow ice-event reads "No snow, but ...").
+RAIN_FAMILY = frozenset({"drizzle", "rain", "heavy_rain", "showers", "thunder", "freezing"})
+SNOW_FAMILY = frozenset({"snow"})
+
 # Upper bound on the per-instance geocoding caches so a long-running bot that's
 # queried for many distinct locations can't grow them without limit.
 _GEOCODE_CACHE_CAP = 256
@@ -362,6 +369,7 @@ def analyze_precip_nowcast(
     current_precip: Optional[float] = None,
     current_code: Optional[int] = None,
     snow: Optional[list[Optional[float]]] = None,
+    family: Optional[frozenset[str]] = None,
 ) -> Optional[NowcastResult]:
     """Pure nowcast analysis over a precipitation time series.
 
@@ -384,9 +392,19 @@ def analyze_precip_nowcast(
         snow: Optional snowfall per bucket, in cm (parallel to `times`). When a
             snow episode is reported, snow_cm gives the depth estimate (snowfall
             is the actual accumulation; precip is only its liquid equivalent).
+        family: Optional set of bucket names (e.g. {"snow"}); a bucket then counts
+            as precipitating only if its code maps into the family. None (default)
+            counts any precip — used to answer "is *snow* coming?" vs "rain?".
     """
     if not times or not precip:
         return None
+
+    def counts(amt: float, code: Optional[int]) -> bool:
+        """Whether a bucket is precipitating for this query (>= threshold, and in
+        the requested precip family when one is given)."""
+        if amt < threshold:
+            return False
+        return family is None or precip_bucket_for_code(code) in family
     n = min(len(times), len(precip))
     try:
         now = datetime.fromisoformat(now_iso)
@@ -427,23 +445,24 @@ def analyze_precip_nowcast(
             break
         upcoming.append((mins, amt, code, sf))
 
-    # "Raining now?" — prefer the API's instantaneous value, else the current bucket.
+    # "Precipitating now?" (of the requested family) — prefer the API's
+    # instantaneous value + current code, else the current bucket.
+    now_code = current_code if current_code is not None else (parsed[cur_idx][2] if cur_idx >= 0 else None)
     if current_precip is not None:
-        raining_now = float(current_precip) >= threshold
+        raining_now = counts(float(current_precip), now_code)
     elif cur_idx >= 0:
-        raining_now = parsed[cur_idx][1] >= threshold
+        raining_now = counts(parsed[cur_idx][1], parsed[cur_idx][2])
     else:
         raining_now = False
 
     if raining_now:
-        now_code = current_code if current_code is not None else (parsed[cur_idx][2] if cur_idx >= 0 else None)
         bucket = precip_bucket_for_code(now_code) or "rain"
         # Accumulate the episode totals: liquid (mm) and snowfall (cm), the current
         # bucket plus each upcoming bucket until precip drops below threshold.
         total = max(0.0, parsed[cur_idx][1]) if cur_idx >= 0 else 0.0
         total_snow = max(0.0, parsed[cur_idx][3]) if cur_idx >= 0 else 0.0
-        for mins, amt, _code, sf in upcoming:
-            if amt < threshold:
+        for mins, amt, code, sf in upcoming:
+            if not counts(amt, code):
                 return NowcastResult(
                     state="raining_stopping", minutes=_round5(mins), bucket=bucket,
                     amount_mm=total, snow_cm=total_snow,
@@ -455,17 +474,17 @@ def analyze_precip_nowcast(
             amount_mm=total, snow_cm=total_snow,
         )
 
-    # Dry now: find the first upcoming precipitating bucket.
+    # Dry now (of the requested family): find the first upcoming precip bucket.
     for idx, (mins, amt, code, sf) in enumerate(upcoming):
-        if amt >= threshold:
+        if counts(amt, code):
             bucket = precip_bucket_for_code(code) or "rain"
             # How long does it last, and how much falls? Walk until it drops below
             # threshold, summing liquid (mm) and snowfall (cm) for the estimate.
             total = amt
             total_snow = sf
             end_mins: Optional[float] = None
-            for mins2, amt2, _c2, sf2 in upcoming[idx + 1:]:
-                if amt2 < threshold:
+            for mins2, amt2, code2, sf2 in upcoming[idx + 1:]:
+                if not counts(amt2, code2):
                     end_mins = mins2
                     break
                 total += amt2
@@ -547,7 +566,7 @@ class RainCommand(BaseCommand):
     """Minute-level rain nowcast for a location (Open-Meteo 15-minutely precip)."""
 
     name = "rain"
-    keywords = ["rain", "nowcast"]
+    keywords = ["rain", "nowcast", "snow"]
     description = "Rain nowcast: when precipitation starts or stops in the next couple hours"
     category = "weather"
     requires_internet = True
@@ -813,13 +832,26 @@ class RainCommand(BaseCommand):
             amt = format_precip_amount(result.amount_mm, self.amount_unit)
         return f" (est {amt})" if amt else ""
 
-    def _format_result(self, result: NowcastResult, location_label: str) -> str:
-        """Render a NowcastResult into a single mesh-friendly line."""
+    def _format_result(
+        self, result: NowcastResult, location_label: str,
+        *, asked_word: Optional[str] = None, mismatch: bool = False,
+    ) -> str:
+        """Render a NowcastResult into a single mesh-friendly line.
+
+        ``asked_word`` is the precip the user asked for ("rain"/"snow"); when
+        ``mismatch`` is set the result is the *other* type, rendered as
+        "No <asked>, but <actual> ..." so a !snow that finds rain still helps.
+        """
         emoji = _BUCKET_EMOJI.get(result.bucket or "rain", "🌧️")
         if result.state == "dry_clear":
             return self.translate(
-                "commands.rain.clear", window=self._window_label(), location=location_label
+                "commands.rain.clear", precip=asked_word or "rain",
+                window=self._window_label(), location=location_label,
             )
+        if mismatch and asked_word:
+            ptype = f"No {asked_word}, but {self._ptype(result.bucket).lower()}"
+        else:
+            ptype = self._ptype(result.bucket)
         if result.state == "dry_incoming":
             if result.open_ended or not result.duration_minutes:
                 extra = self.translate("commands.rain.duration_open")
@@ -827,27 +859,18 @@ class RainCommand(BaseCommand):
                 extra = self.translate("commands.rain.duration_for", duration=result.duration_minutes)
             return self.translate(
                 "commands.rain.starting",
-                emoji=emoji,
-                ptype=self._ptype(result.bucket),
-                minutes=result.minutes,
-                location=location_label,
-                extra=extra,
+                emoji=emoji, ptype=ptype, minutes=result.minutes,
+                location=location_label, extra=extra,
             ) + self._amount_suffix(result)
         if result.state == "raining_stopping":
             return self.translate(
                 "commands.rain.stopping",
-                emoji=emoji,
-                ptype=self._ptype(result.bucket),
-                minutes=result.minutes,
-                location=location_label,
+                emoji=emoji, ptype=ptype, minutes=result.minutes, location=location_label,
             ) + self._amount_suffix(result)
         # raining_continuing
         return self.translate(
             "commands.rain.continuing",
-            emoji=emoji,
-            ptype=self._ptype(result.bucket),
-            window=self._window_label(),
-            location=location_label,
+            emoji=emoji, ptype=ptype, window=self._window_label(), location=location_label,
         ) + self._amount_suffix(result)
 
     async def execute(self, message: MeshMessage) -> bool:
@@ -856,6 +879,19 @@ class RainCommand(BaseCommand):
             content = content[1:].strip()
         parts = content.split()
         location: Optional[str] = " ".join(parts[1:]).strip() if len(parts) >= 2 else None
+
+        # Which keyword triggered us sets the precip we're asked about. !snow hunts
+        # snow first, !rain hunts rain; !nowcast (or anything else) has no preference.
+        mode = parts[0].lower() if parts else "rain"
+        if mode == "snow":
+            asked_family: Optional[frozenset[str]] = SNOW_FAMILY
+            asked_word: Optional[str] = "snow"
+        elif mode == "nowcast":
+            asked_family = None
+            asked_word = None
+        else:
+            asked_family = RAIN_FAMILY
+            asked_word = "rain"
 
         # Bare country/US state (e.g. "france", "texas") -> default to its capital
         # and append a heads-up, since one centroid point isn't representative.
@@ -898,22 +934,30 @@ class RainCommand(BaseCommand):
             await self.send_response(message, self.translate("commands.rain.error_fetching"))
             return True
 
-        result = analyze_precip_nowcast(
-            series["times"],
-            series["precip"],
-            series["codes"],
-            series["now"],
-            window_minutes=self.window_minutes,
-            threshold=self.threshold_mm,
-            current_precip=series.get("current_precip"),
-            current_code=series.get("current_code"),
-            snow=series.get("snow"),
-        )
+        def run(fam: Optional[frozenset[str]]) -> Optional[NowcastResult]:
+            return analyze_precip_nowcast(
+                series["times"], series["precip"], series["codes"], series["now"],
+                window_minutes=self.window_minutes, threshold=self.threshold_mm,
+                current_precip=series.get("current_precip"), current_code=series.get("current_code"),
+                snow=series.get("snow"), family=fam,
+            )
+
+        # Look for the asked-for precip first; if none is coming, fall back to
+        # whatever IS (rendered with a "No <asked>, but ..." lead).
+        result = run(asked_family)
         if result is None:
             await self.send_response(message, self.translate("commands.rain.error_fetching"))
             return True
+        mismatch = False
+        if asked_family is not None and result.state == "dry_clear":
+            other = run(None)
+            if other is not None and other.state != "dry_clear":
+                result, mismatch = other, True
 
-        response = self._format_result(result, location_label or f"{lat:.1f},{lon:.1f}")
+        response = self._format_result(
+            result, location_label or f"{lat:.1f},{lon:.1f}",
+            asked_word=asked_word, mismatch=mismatch,
+        )
         if region_note:
             response = f"{response} {region_note}"
         max_len = self.get_max_message_length(message)
