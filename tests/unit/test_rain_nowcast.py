@@ -13,6 +13,7 @@ from modules.commands.rain_command import (
     city_display_name,
     decide_rain_notification,
     format_precip_amount,
+    join_location,
     precip_bucket_for_code,
     precip_descriptor,
     titlecase_location,
@@ -414,3 +415,32 @@ def test_format_amount_mm_unit():
     assert format_precip_amount(5.0, "mm") == "5.0 mm"
     assert format_precip_amount(12.3, "mm") == "12.3 mm"
     assert format_precip_amount(0.05, "mm") == "<0.1 mm"
+
+
+# --- join_location (the 'Spain, Spain' dedup) -------------------------------
+
+def test_join_location_dedupes_equal_names():
+    # The reported bug: '!rain spain' -> city 'Spain' + country 'Spain'.
+    assert join_location("Spain", "Spain") == "Spain"
+    assert join_location("Singapore", "Singapore") == "Singapore"
+    assert join_location("spain", "Spain") == "Spain"   # case-insensitive
+
+
+def test_join_location_keeps_distinct_names():
+    assert join_location("Nashville", "TN") == "Nashville, TN"
+    assert join_location("Paris", "France") == "Paris, France"
+
+
+def test_join_location_handles_missing_sides():
+    assert join_location("Nashville", None) == "Nashville"
+    assert join_location("Nashville", "") == "Nashville"
+    assert join_location(None, "France") == "France"
+    assert join_location("", "France") == "France"
+    assert join_location(None, None) == ""
+
+
+def test_spain_end_to_end_label():
+    # city_display_name + join_location together, as _resolve_location does it.
+    suffix = "Spain"
+    typed_city = city_display_name("spain", suffix)
+    assert join_location(typed_city, suffix) == "Spain"   # not "Spain, Spain"

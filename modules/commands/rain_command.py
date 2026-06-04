@@ -132,6 +132,23 @@ def city_display_name(typed_location: str, suffix: Optional[str] = None) -> str:
     return titlecase_location(head)
 
 
+def join_location(city: Optional[str], suffix: Optional[str]) -> str:
+    """Join a city and its state/country suffix as 'City, Suffix'.
+
+    Collapses to a single name when one side is missing or the two name the same
+    place (case-insensitive) — so a country typed as the city ('spain' -> 'Spain',
+    not 'Spain, Spain') or a city-state ('Singapore', not 'Singapore, Singapore')
+    renders once.
+    """
+    city = (city or "").strip()
+    suffix = (suffix or "").strip()
+    if not suffix:
+        return city
+    if not city or city.lower() == suffix.lower():
+        return suffix
+    return f"{city}, {suffix}"
+
+
 def reverse_geocode_region(
     bot: Any, lat: float, lon: float, *, timeout: int = 10, logger: Any = None
 ) -> tuple[Optional[str], Optional[str]]:
@@ -613,7 +630,7 @@ class RainCommand(BaseCommand):
         city, suffix = self._reverse_geocode(lat, lon)
         if not city:
             return None
-        return f"{city}, {suffix}" if suffix else city
+        return join_location(city, suffix)
 
     def _suffix_for_coords(self, lat: float, lon: float) -> Optional[str]:
         """US state abbreviation or country name for coordinates (enriches a known city)."""
@@ -638,7 +655,7 @@ class RainCommand(BaseCommand):
                     city = (places[0].get("place name") or "").strip()
                     st = (places[0].get("state abbreviation") or "").strip()
                     if city:
-                        name = f"{city}, {st}" if st else city
+                        name = join_location(city, st)
         except Exception as e:
             self.logger.debug(f"Zippopotam ZIP lookup failed for {z}: {e}")
         if name:
@@ -672,7 +689,7 @@ class RainCommand(BaseCommand):
                 # Prefer the configured default city + state for the bot's own location.
                 if self.default_city:
                     suffix = self.default_state or self._suffix_for_coords(bot_loc[0], bot_loc[1])
-                    label = f"{self.default_city}, {suffix}" if suffix else self.default_city
+                    label = join_location(self.default_city, suffix)
                 else:
                     label = self._coordinates_to_location_string(bot_loc[0], bot_loc[1]) or f"{bot_loc[0]:.1f},{bot_loc[1]:.1f}"
                 return (bot_loc[0], bot_loc[1], label, None)
@@ -725,7 +742,7 @@ class RainCommand(BaseCommand):
         # — stripping any region the user already typed so it isn't doubled.
         suffix = self._suffix_for_coords(lat, lon)
         typed_city = city_display_name(loc, suffix)
-        label = f"{typed_city}, {suffix}" if suffix else typed_city
+        label = join_location(typed_city, suffix)
         return (lat, lon, label, None)
 
     def _fetch_series(self, lat: float, lon: float) -> Optional[dict]:

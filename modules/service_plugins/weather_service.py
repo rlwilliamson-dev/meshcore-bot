@@ -35,6 +35,7 @@ from ..commands.rain_command import (
     decide_rain_notification,
     fetch_precip_series,
     format_precip_amount,
+    join_location,
     precip_descriptor,
     reverse_geocode_region,
 )
@@ -950,7 +951,7 @@ class WeatherService(BaseServicePlugin):
                     self.bot, self.my_position_lat, self.my_position_lon, timeout=10, logger=self.logger
                 ),
             )
-            self._cached_rain_location = (f"{city}, {suffix}" if suffix else city) if city else ""
+            self._cached_rain_location = join_location(city, suffix)
         location = f" near {self._cached_rain_location}" if self._cached_rain_location else ""
 
         amt = (
