@@ -226,6 +226,24 @@ def format_precip_amount(mm: Optional[float], unit: str = "in") -> Optional[str]
     return f"{inches:.2f}".rstrip("0").rstrip(".") + " in"
 
 
+def format_snow_amount(cm: Optional[float], unit: str = "in") -> Optional[str]:
+    """Format a snowfall total (cm of actual snow) for display, or None if negligible.
+
+    Snow is reported as depth, not liquid equivalent (Open-Meteo's ``precipitation``
+    is the melted equivalent, ~7x less). ``unit`` "in" renders inches of snow (US
+    default), anything else centimetres. The trailing " snow" keeps it distinct
+    from the liquid rain estimate; 0.1 precision suits snow's coarseness.
+    """
+    if cm is None or cm <= 0:
+        return None
+    if unit == "mm":
+        return f"{cm:.1f} cm snow" if cm >= 0.1 else "<0.1 cm snow"
+    inches = cm * 0.393701
+    if inches < 0.1:
+        return "<0.1 in snow"
+    return f"{inches:.1f}".rstrip("0").rstrip(".") + " in snow"
+
+
 def fetch_precip_series(
     session: Any,
     lat: float,
@@ -239,16 +257,17 @@ def fetch_precip_series(
 
     Prefers 15-minutely data; falls back to hourly when a model doesn't provide
     minutely_15. The caller owns the session's lifecycle. Returns a dict with
-    keys times, precip, codes, now, current_precip, current_code, step — or None
-    on any error. Precipitation is requested in mm (detection is unit-independent).
+    keys times, precip, snow, codes, now, current_precip, current_code, step — or
+    None on any error. Precipitation is requested in mm (detection is
+    unit-independent); snowfall comes in cm (Open-Meteo's snow-depth estimate).
     """
     api_url = "https://api.open-meteo.com/v1/forecast"
     params: dict[str, Any] = {
         "latitude": lat,
         "longitude": lon,
-        "minutely_15": "precipitation,weather_code",
-        "hourly": "precipitation,weather_code",
-        "current": "precipitation,weather_code",
+        "minutely_15": "precipitation,snowfall,weather_code",
+        "hourly": "precipitation,snowfall,weather_code",
+        "current": "precipitation,snowfall,weather_code",
         "precipitation_unit": "mm",
         "timezone": "auto",
         "forecast_days": 2,  # cover the window even when "now" is late in the day
@@ -280,6 +299,7 @@ def fetch_precip_series(
         return {
             "times": m_times,
             "precip": m_precip,
+            "snow": m15.get("snowfall") or [],
             "codes": m15.get("weather_code") or [],
             "now": now,
             "current_precip": current.get("precipitation"),
@@ -294,6 +314,7 @@ def fetch_precip_series(
     return {
         "times": h_times,
         "precip": hourly.get("precipitation") or [],
+        "snow": hourly.get("snowfall") or [],
         "codes": hourly.get("weather_code") or [],
         "now": now,
         "current_precip": current.get("precipitation"),
@@ -318,7 +339,8 @@ class NowcastResult:
     duration_minutes: Optional[int] = None  # for dry_incoming: how long the precip lasts
     open_ended: bool = False                # precip extends past the analysis window
     bucket: Optional[str] = None            # precip bucket (drizzle/rain/snow/...) when raining/incoming
-    amount_mm: Optional[float] = None       # estimated precip total (mm) over the episode within the window
+    amount_mm: Optional[float] = None       # estimated liquid precip total (mm) over the episode within the window
+    snow_cm: Optional[float] = None         # estimated snowfall total (cm) over the episode (snow depth, not liquid)
 
 
 def _round5(minutes: float) -> int:
@@ -339,6 +361,7 @@ def analyze_precip_nowcast(
     threshold: float = 0.1,
     current_precip: Optional[float] = None,
     current_code: Optional[int] = None,
+    snow: Optional[list[Optional[float]]] = None,
 ) -> Optional[NowcastResult]:
     """Pure nowcast analysis over a precipitation time series.
 
@@ -358,6 +381,9 @@ def analyze_precip_nowcast(
             preferred over the bucket value for the "raining right now" decision.
         current_code: Optional current WMO code, used for the precip type when
             raining now.
+        snow: Optional snowfall per bucket, in cm (parallel to `times`). When a
+            snow episode is reported, snow_cm gives the depth estimate (snowfall
+            is the actual accumulation; precip is only its liquid equivalent).
     """
     if not times or not precip:
         return None
@@ -367,7 +393,7 @@ def analyze_precip_nowcast(
     except (TypeError, ValueError):
         return None
 
-    parsed: list[tuple[datetime, float, Optional[int]]] = []
+    parsed: list[tuple[datetime, float, Optional[int], float]] = []
     for i in range(n):
         try:
             t = datetime.fromisoformat(times[i])
@@ -376,28 +402,30 @@ def analyze_precip_nowcast(
         amt = precip[i]
         amt = 0.0 if amt is None else float(amt)
         code = codes[i] if i < len(codes) else None
-        parsed.append((t, amt, code))
+        sf = snow[i] if (snow is not None and i < len(snow)) else None
+        sf = 0.0 if sf is None else float(sf)
+        parsed.append((t, amt, code, sf))
     if not parsed:
         return None
     parsed.sort(key=lambda x: x[0])
 
     # Index of the bucket containing "now" (largest start time <= now).
     cur_idx = -1
-    for i, (t, _amt, _c) in enumerate(parsed):
+    for i, (t, _amt, _c, _sf) in enumerate(parsed):
         if t <= now:
             cur_idx = i
         else:
             break
 
     # Upcoming buckets strictly after now, within the window.
-    upcoming: list[tuple[float, float, Optional[int]]] = []  # (minutes_from_now, amount, code)
-    for t, amt, code in parsed[cur_idx + 1:]:
+    upcoming: list[tuple[float, float, Optional[int], float]] = []  # (mins, precip_mm, code, snow_cm)
+    for t, amt, code, sf in parsed[cur_idx + 1:]:
         mins = (t - now).total_seconds() / 60.0
         if mins <= 0:
             continue
         if mins > window_minutes:
             break
-        upcoming.append((mins, amt, code))
+        upcoming.append((mins, amt, code, sf))
 
     # "Raining now?" — prefer the API's instantaneous value, else the current bucket.
     if current_precip is not None:
@@ -410,36 +438,42 @@ def analyze_precip_nowcast(
     if raining_now:
         now_code = current_code if current_code is not None else (parsed[cur_idx][2] if cur_idx >= 0 else None)
         bucket = precip_bucket_for_code(now_code) or "rain"
-        # Accumulate the episode total (mm): the current bucket plus each upcoming
-        # bucket until the rain drops below threshold (or the window ends).
+        # Accumulate the episode totals: liquid (mm) and snowfall (cm), the current
+        # bucket plus each upcoming bucket until precip drops below threshold.
         total = max(0.0, parsed[cur_idx][1]) if cur_idx >= 0 else 0.0
-        for mins, amt, _code in upcoming:
+        total_snow = max(0.0, parsed[cur_idx][3]) if cur_idx >= 0 else 0.0
+        for mins, amt, _code, sf in upcoming:
             if amt < threshold:
                 return NowcastResult(
-                    state="raining_stopping", minutes=_round5(mins), bucket=bucket, amount_mm=total
+                    state="raining_stopping", minutes=_round5(mins), bucket=bucket,
+                    amount_mm=total, snow_cm=total_snow,
                 )
             total += amt
+            total_snow += sf
         return NowcastResult(
-            state="raining_continuing", open_ended=True, bucket=bucket, amount_mm=total
+            state="raining_continuing", open_ended=True, bucket=bucket,
+            amount_mm=total, snow_cm=total_snow,
         )
 
     # Dry now: find the first upcoming precipitating bucket.
-    for idx, (mins, amt, code) in enumerate(upcoming):
+    for idx, (mins, amt, code, sf) in enumerate(upcoming):
         if amt >= threshold:
             bucket = precip_bucket_for_code(code) or "rain"
             # How long does it last, and how much falls? Walk until it drops below
-            # threshold, summing the episode's buckets for an amount estimate.
+            # threshold, summing liquid (mm) and snowfall (cm) for the estimate.
             total = amt
+            total_snow = sf
             end_mins: Optional[float] = None
-            for mins2, amt2, _c2 in upcoming[idx + 1:]:
+            for mins2, amt2, _c2, sf2 in upcoming[idx + 1:]:
                 if amt2 < threshold:
                     end_mins = mins2
                     break
                 total += amt2
+                total_snow += sf2
             if end_mins is None:
                 return NowcastResult(
                     state="dry_incoming", minutes=_round5(mins), open_ended=True,
-                    bucket=bucket, amount_mm=total,
+                    bucket=bucket, amount_mm=total, snow_cm=total_snow,
                 )
             return NowcastResult(
                 state="dry_incoming",
@@ -447,6 +481,7 @@ def analyze_precip_nowcast(
                 duration_minutes=_round5(end_mins - mins),
                 bucket=bucket,
                 amount_mm=total,
+                snow_cm=total_snow,
             )
 
     return NowcastResult(state="dry_clear")
@@ -769,10 +804,13 @@ class RainCommand(BaseCommand):
         return self.translate(f"commands.rain.precip_types.{b}")
 
     def _amount_suffix(self, result: NowcastResult) -> str:
-        """' (est 0.2 in)' for a nowcast result, or '' when off/negligible."""
+        """' (est 0.2 in)' for rain, ' (est 1.5 in snow)' for snow, else ''."""
         if not self.show_amount:
             return ""
-        amt = format_precip_amount(result.amount_mm, self.amount_unit)
+        if result.bucket == "snow":
+            amt = format_snow_amount(result.snow_cm, self.amount_unit)
+        else:
+            amt = format_precip_amount(result.amount_mm, self.amount_unit)
         return f" (est {amt})" if amt else ""
 
     def _format_result(self, result: NowcastResult, location_label: str) -> str:
@@ -869,6 +907,7 @@ class RainCommand(BaseCommand):
             threshold=self.threshold_mm,
             current_precip=series.get("current_precip"),
             current_code=series.get("current_code"),
+            snow=series.get("snow"),
         )
         if result is None:
             await self.send_response(message, self.translate("commands.rain.error_fetching"))

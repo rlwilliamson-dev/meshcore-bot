@@ -13,6 +13,7 @@ from modules.commands.rain_command import (
     city_display_name,
     decide_rain_notification,
     format_precip_amount,
+    format_snow_amount,
     join_location,
     precip_bucket_for_code,
     precip_descriptor,
@@ -416,6 +417,38 @@ def test_format_amount_mm_unit():
     assert format_precip_amount(5.0, "mm") == "5.0 mm"
     assert format_precip_amount(12.3, "mm") == "12.3 mm"
     assert format_precip_amount(0.05, "mm") == "<0.1 mm"
+
+
+# --- snowfall amount (depth, not liquid equivalent) -------------------------
+
+def test_amount_snow_uses_snowfall_series():
+    # Snow incoming 14:30-14:45: 3.5 cm/bucket snow vs only 0.5 mm/bucket liquid.
+    precip = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    snow = [0.0, 0.0, 3.5, 3.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    codes = [0, 0, 73, 73, 0, 0, 0, 0, 0]
+    r = analyze_precip_nowcast(TIMES_15, precip, codes, NOW, window_minutes=120, snow=snow)
+    assert r.state == "dry_incoming"
+    assert r.bucket == "snow"
+    assert abs(r.amount_mm - 1.0) < 1e-9   # liquid equivalent
+    assert abs(r.snow_cm - 7.0) < 1e-9     # actual snow depth (the useful number)
+
+
+def test_amount_snow_none_series_defaults_zero():
+    # No snow series -> snow_cm sums to 0; the rain path is unaffected.
+    precip = [0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+    r = analyze_precip_nowcast(TIMES_15, precip, _codes(9, 61), NOW, window_minutes=120)
+    assert r.state == "dry_incoming"
+    assert r.bucket == "rain"
+    assert r.snow_cm == 0.0
+
+
+def test_format_snow_amount():
+    assert format_snow_amount(7.0, "in") == "2.8 in snow"    # 7 cm -> ~2.8"
+    assert format_snow_amount(2.54, "in") == "1 in snow"      # exact inch
+    assert format_snow_amount(0.1, "in") == "<0.1 in snow"
+    assert format_snow_amount(0.0, "in") is None
+    assert format_snow_amount(None, "in") is None
+    assert format_snow_amount(12.5, "mm") == "12.5 cm snow"   # metric shows cm
 
 
 # --- join_location (the 'Spain, Spain' dedup) -------------------------------
