@@ -34,7 +34,20 @@ class SatpassCommand(BaseCommand):
     'hubble': '20580',
     'starlink': '44294',  # Example Starlink satellite
     'tiangong': '48274',  # Tiangong space station
+    # LOCAL MOD (not upstream): weather satellites for a WX bot.
+    # NOAA POES (APT/HRPT)
+    'noaa15': '25338',
+    'noaa18': '28654',
+    'noaa19': '33591',
+    # EUMETSAT Metop polar
+    'metop-a': '29499', 'metopa': '29499',
+    'metop-b': '38771', 'metopb': '38771',
+    'metop-c': '43689', 'metopc': '43689',
+    # GOES geostationary
+    'goes16': '41866',
+    'goes17': '43226',
     'goes18': '51850',  # GOES-18 weather satellite
+    'goes19': '60133',
     }
 
     def __init__(self, bot):

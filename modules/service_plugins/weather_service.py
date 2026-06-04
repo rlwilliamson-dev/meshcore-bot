@@ -41,6 +41,45 @@ from ..url_shortener import shorten_url
 from ..utils import format_temperature_high_low, get_config_timezone
 from .base_service import BaseServicePlugin
 
+# LOCAL MOD (not upstream): max body bytes per mesh message for chunked alerts.
+# Conservative (under the 160-byte cipher limit, leaving room for the "user: " prefix).
+ALERT_CHUNK_BYTES = 144
+
+
+def chunk_alert_text(body: str, url: str = "", *, max_bytes: int = ALERT_CHUNK_BYTES) -> list[str]:
+    """Split an alert into mesh-sized messages without ever breaking a link.
+
+    LOCAL MOD (not upstream). Word-splits ``body`` into <= max_bytes (UTF-8) chunks;
+    appends ``url`` whole to the last chunk, or as its own final message if it
+    doesn't fit. Continuation chunks are prefixed ``...``. A single token longer
+    than max_bytes (e.g. an un-shortened URL) still gets its own message rather
+    than being cut. Pure/testable.
+    """
+    chunks: list[str] = []
+    current = ""
+    for word in body.split():
+        candidate = f"{current} {word}" if current else word
+        if len(candidate.encode("utf-8")) <= max_bytes:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = word  # word alone may exceed max_bytes; keep it whole anyway
+    if current:
+        chunks.append(current)
+    if not chunks:
+        chunks = [""]
+
+    # Attach the link whole: end of the last chunk if it fits, else its own message.
+    if url:
+        last = chunks[-1]
+        if last and len(f"{last} {url}".encode()) <= max_bytes:
+            chunks[-1] = f"{last} {url}"
+        else:
+            chunks.append(url)
+
+    return [c if i == 0 else f"...{c}" for i, c in enumerate(chunks)]
+
 
 class WeatherService(BaseServicePlugin):
     """Weather service providing scheduled forecasts and alert monitoring.
@@ -66,6 +105,12 @@ class WeatherService(BaseServicePlugin):
         self.my_position_lon = self.bot.config.getfloat('Weather_Service', 'my_position_lon', fallback=None)
         self.weather_channel = self.bot.config.get('Weather_Service', 'weather_channel', fallback='general')
         self.alerts_channel = self.bot.config.get('Weather_Service', 'alerts_channel', fallback='general')
+        # LOCAL MOD (not upstream): split comma-separated channel lists so forecast/
+        # alerts post to every listed channel.
+        self._weather_channels = [c.strip() for c in self.weather_channel.split(',') if c.strip()]
+        self._alerts_channels = [c.strip() for c in self.alerts_channel.split(',') if c.strip()]
+        # LOCAL MOD: track the date the daily forecast last posted (dedup).
+        self._last_forecast_date: Optional[Any] = None
         self.weather_model = self._load_weather_model()
 
         # Polling intervals (in milliseconds, converted to seconds)
@@ -100,6 +145,8 @@ class WeatherService(BaseServicePlugin):
         # Open-Meteo 15-minutely logic for the bot's own position.
         self.rain_nowcast_enabled = self.bot.config.getboolean('Weather_Service', 'rain_nowcast_enabled', fallback=False)
         self.rain_channel = self.bot.config.get('Weather_Service', 'rain_channel', fallback=self.weather_channel)
+        # LOCAL MOD: rain push to the channel list too.
+        self._rain_channels = [c.strip() for c in self.rain_channel.split(',') if c.strip()]
         self.poll_rain_nowcast_interval = self.bot.config.getint('Weather_Service', 'poll_rain_nowcast_interval', fallback=900000) / 1000.0
         self.rain_nowcast_lead_minutes = self.bot.config.getint('Weather_Service', 'rain_nowcast_lead_minutes', fallback=60)
         self.rain_nowcast_renotify_minutes = self.bot.config.getint('Weather_Service', 'rain_nowcast_renotify_minutes', fallback=30)
@@ -441,17 +488,20 @@ class WeatherService(BaseServicePlugin):
         Uses Open-Meteo for weather data and manages its own error logging.
         """
         try:
+            # LOCAL MOD: dedup — skip if already posted today (local date).
+            today = datetime.now().date()
+            if self._last_forecast_date == today:
+                self.logger.debug("Daily forecast already sent today; skipping")
+                return
+
             # Get weather forecast
             forecast_text = await self._get_weather_forecast()
 
             if forecast_text and forecast_text != "Error fetching weather data":
-                # Send to configured channel
-                await self.bot.command_manager.send_channel_message(
-                    self.weather_channel,
-                    f"🌤️ Daily Weather: {forecast_text}",
-                    scope=self.get_mesh_flood_scope(),
-                )
-                self.logger.info(f"Daily weather forecast sent to {self.weather_channel}")
+                # LOCAL MOD: post to every weather channel.
+                await self._send_to_channels(self._weather_channels, f"🌤️ Daily Weather: {forecast_text}")
+                self._last_forecast_date = today
+                self.logger.info(f"Daily weather forecast sent to {self._weather_channels}")
             else:
                 self.logger.warning("Failed to get weather forecast for daily update")
         except Exception as e:
@@ -777,21 +827,20 @@ class WeatherService(BaseServicePlugin):
                     self.logger.debug(f"Error parsing alert entry: {e}")
                     continue
 
-            # Send new alerts with compact formatting
+            # LOCAL MOD (not upstream): full (non-abbreviated) alerts, URL-safe
+            # chunking for long ones, posted to every alerts channel.
             for alert in alerts:
                 try:
-                    # Format alert using compact formatter (same as wx_command)
-                    alert_text = await self._format_alert_compact(alert, include_details=True)
-
-                    await self.bot.command_manager.send_channel_message(
-                        self.alerts_channel,
-                        alert_text,
-                        scope=self.get_mesh_flood_scope(),
+                    body, short_url = await self._format_alert_full(alert)
+                    chunks = chunk_alert_text(body, short_url)
+                    for ci, chunk in enumerate(chunks):
+                        await self._send_to_channels(self._alerts_channels, chunk)
+                        if ci < len(chunks) - 1:
+                            await asyncio.sleep(2.0)  # pace chunks above the rate limit
+                    self.logger.info(
+                        f"Weather alert sent ({len(chunks)} msg): {alert.get('title', 'Unknown')}"
                     )
-                    self.logger.info(f"Weather alert sent: {alert.get('title', 'Unknown')}")
-
-                    # Small delay between alerts
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(2)  # delay between distinct alerts
 
                 except Exception as e:
                     self.logger.error(f"Error sending weather alert: {e}")
@@ -869,16 +918,13 @@ class WeatherService(BaseServicePlugin):
                 return
 
             message = await self._format_rain_nowcast(result, kind)
-            await self.bot.command_manager.send_channel_message(
-                self.rain_channel,
-                message,
-                scope=self.get_mesh_flood_scope(),
-            )
+            # LOCAL MOD: rain push to every rain channel.
+            await self._send_to_channels(self._rain_channels, message)
             if kind == "starting":
                 self._last_rain_start_time = now_ts
             else:
                 self._last_rain_end_time = now_ts
-            self.logger.info(f"Rain nowcast ({kind}) sent to {self.rain_channel}: {message}")
+            self.logger.info(f"Rain nowcast ({kind}) sent to {self._rain_channels}: {message}")
 
         except Exception as e:
             self.logger.error(f"Error checking rain nowcast: {e}")
@@ -1117,11 +1163,8 @@ class WeatherService(BaseServicePlugin):
                 else:
                     message = f"🌩️ Lightning activity ({int(distance)}km {compass_name})"
 
-                await self.bot.command_manager.send_channel_message(
-                    self.alerts_channel,
-                    message,
-                    scope=self.get_mesh_flood_scope(),
-                )
+                # LOCAL MOD: lightning alert to every alerts channel.
+                await self._send_to_channels(self._alerts_channels, message)
                 self.logger.info(f"Lightning alert sent: {message}")
 
                 # Mark this bucket as seen
@@ -1453,6 +1496,73 @@ class WeatherService(BaseServicePlugin):
         except Exception as e:
             self.logger.debug(f"Error parsing alert entry: {e}")
             return None
+
+    async def _send_to_channels(self, channels: list[str], text: str) -> None:
+        """LOCAL MOD (not upstream): post `text` to each channel in the list.
+
+        Paced 6 s apart to stay above the bot/per-channel rate limits (which drop
+        rather than queue). Used for daily forecast, alerts, and rain pushes.
+        """
+        for i, ch in enumerate(channels):
+            try:
+                await self.bot.command_manager.send_channel_message(
+                    ch, text, scope=self.get_mesh_flood_scope(),
+                )
+            except Exception as e:
+                self.logger.error(f"Error sending weather message to {ch}: {e}")
+            if i < len(channels) - 1:
+                await asyncio.sleep(6.0)
+
+    async def _format_alert_full(self, alert: dict[str, Any]) -> tuple[str, str]:
+        """LOCAL MOD (not upstream): full, non-abbreviated alert text + shortened URL.
+
+        Returns (body, short_url); the caller chunks the body and appends the URL
+        URL-safely. Keeps the severity emoji and the real NWS event name + details
+        (no compact abbreviation).
+        """
+        severity = alert.get('severity', 'Unknown')
+        emoji = {'Extreme': '🔴', 'Severe': '🟠', 'Moderate': '🟡',
+                 'Minor': '⚪', 'Unknown': '⚪'}.get(severity, '⚪')
+        event = (alert.get('event') or alert.get('event_type') or 'Weather Alert').strip()
+        parts = [f"{emoji} {event}"]
+
+        # Location: first area in full, "+N more" if several (not abbreviated).
+        area = (alert.get('area_desc') or '').strip()
+        if area:
+            locs = [loc.strip() for loc in area.split(';') if loc.strip()]
+            if locs:
+                loc_str = locs[0] + (f" +{len(locs) - 1} more" if len(locs) > 1 else "")
+                parts.append(f"for {loc_str}")
+
+        expires = alert.get('expires', '')
+        if expires:
+            exp = self._compact_time(expires).strip()
+            if exp:
+                parts.append(f"until {exp}")
+
+        text = ' '.join(parts)
+
+        # Details: NWS headline, else summary — capped so a huge bulletin doesn't
+        # explode into a dozen chunks.
+        details = (alert.get('nws_headline') or alert.get('summary') or '').strip()
+        if details:
+            if len(details) > 300:
+                details = details[:297].rstrip() + '...'
+            text += f". {details}"
+
+        office = (alert.get('office') or '').strip()
+        if office:
+            text += f". {office}"
+
+        short_url = ''
+        link_url = alert.get('link', '')
+        if link_url:
+            try:
+                short_url = await self._shorten_url(link_url) or ''
+            except Exception:
+                short_url = ''
+
+        return text, short_url
 
     async def _format_alert_compact(self, alert: dict[str, Any], include_details: bool = True) -> str:
         """Format a single alert compactly (same as wx_command).
