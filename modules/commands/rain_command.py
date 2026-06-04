@@ -15,6 +15,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from ..models import MeshMessage
+from ..region_capitals import REGION_DEFAULT_NOTE, region_capital_query
 from ..utils import geocode_city_sync, geocode_zipcode_sync, normalize_us_state
 from .base_command import BaseCommand
 
@@ -818,6 +819,14 @@ class RainCommand(BaseCommand):
         parts = content.split()
         location: Optional[str] = " ".join(parts[1:]).strip() if len(parts) >= 2 else None
 
+        # Bare country/US state (e.g. "france", "texas") -> default to its capital
+        # and append a heads-up, since one centroid point isn't representative.
+        region_note: Optional[str] = None
+        cap_query = region_capital_query(location)
+        if cap_query:
+            location = cap_query
+            region_note = REGION_DEFAULT_NOTE
+
         lat, lon, location_label, err_key = self._resolve_location(message, location)
         if lat is None or lon is None:
             region = self.default_state or self.default_country
@@ -866,6 +875,8 @@ class RainCommand(BaseCommand):
             return True
 
         response = self._format_result(result, location_label or f"{lat:.1f},{lon:.1f}")
+        if region_note:
+            response = f"{response} {region_note}"
         max_len = self.get_max_message_length(message)
         if len(response) > max_len:
             response = response[: max_len - 3] + "..."

@@ -18,6 +18,7 @@ from modules.commands.rain_command import (
     precip_descriptor,
     titlecase_location,
 )
+from modules.region_capitals import REGION_DEFAULT_NOTE, region_capital_query
 
 NOW = "2026-06-03T14:00"
 
@@ -444,3 +445,47 @@ def test_spain_end_to_end_label():
     suffix = "Spain"
     typed_city = city_display_name("spain", suffix)
     assert join_location(typed_city, suffix) == "Spain"   # not "Spain, Spain"
+
+
+# --- region_capital_query (bare country/state -> capital) --------------------
+
+def test_region_capital_country():
+    assert region_capital_query("france") == "Paris, France"
+    assert region_capital_query("spain") == "Madrid, Spain"
+    assert region_capital_query("japan") == "Tokyo, Japan"
+
+
+def test_region_capital_us_state():
+    assert region_capital_query("texas") == "Austin, TX"
+    assert region_capital_query("california") == "Sacramento, CA"
+    assert region_capital_query("georgia") == "Atlanta, GA"   # US state wins over country
+
+
+def test_region_capital_aliases_and_normalization():
+    assert region_capital_query("uk") == "London, United Kingdom"
+    assert region_capital_query("usa") == "Washington, United States"
+    assert region_capital_query("FRANCE") == "Paris, France"     # case-insensitive
+    assert region_capital_query("  texas  ") == "Austin, TX"      # trimmed
+
+
+def test_region_capital_excludes_city_dominant_states():
+    # New York / Washington almost always mean the city -> not defaulted.
+    assert region_capital_query("new york") is None
+    assert region_capital_query("washington") is None
+
+
+def test_region_capital_non_regions_pass_through():
+    assert region_capital_query("paris") is None          # a city, not a region
+    assert region_capital_query("nashville") is None
+    assert region_capital_query("paris, france") is None  # already qualified
+    assert region_capital_query("37013") is None          # a ZIP
+    assert region_capital_query("") is None
+    assert region_capital_query(None) is None
+
+
+def test_region_note_fits_channel_budget():
+    # 160-byte channel cap minus 'BNA-WX-BOT-V3: ' prefix = 145 body bytes.
+    budget = 160 - len("BNA-WX-BOT-V3".encode()) - 2
+    worst_forecast = "🌧️ Heavy rain steady for 2h+ in Paris, France (est 0.5 in)"
+    combined = f"{worst_forecast} {REGION_DEFAULT_NOTE}"
+    assert len(combined.encode("utf-8")) <= budget
