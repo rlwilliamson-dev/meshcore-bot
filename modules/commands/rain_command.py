@@ -251,6 +251,23 @@ def format_snow_amount(cm: Optional[float], unit: str = "in") -> Optional[str]:
     return f"{inches:.1f}".rstrip("0").rstrip(".") + " in snow"
 
 
+def format_amount_estimate(
+    bucket: Optional[str], amount_mm: Optional[float], snow_cm: Optional[float], unit: str = "in"
+) -> Optional[str]:
+    """The estimate string for a precip bucket, or None if negligible.
+
+    Picks the right quantity per type: snow shows depth ("3 in snow"); freezing
+    rain shows its liquid/glaze amount tagged "ice" ("0.1 in ice", ~1:1 with
+    accretion); everything else is plain liquid ("0.2 in").
+    """
+    if bucket == "snow":
+        return format_snow_amount(snow_cm, unit)
+    amt = format_precip_amount(amount_mm, unit)
+    if amt and bucket == "freezing":
+        return f"{amt} ice"
+    return amt
+
+
 def fetch_precip_series(
     session: Any,
     lat: float,
@@ -823,13 +840,10 @@ class RainCommand(BaseCommand):
         return self.translate(f"commands.rain.precip_types.{b}")
 
     def _amount_suffix(self, result: NowcastResult) -> str:
-        """' (est 0.2 in)' for rain, ' (est 1.5 in snow)' for snow, else ''."""
+        """' (est 0.2 in)' rain, ' (est 1.5 in snow)', ' (est 0.1 in ice)', else ''."""
         if not self.show_amount:
             return ""
-        if result.bucket == "snow":
-            amt = format_snow_amount(result.snow_cm, self.amount_unit)
-        else:
-            amt = format_precip_amount(result.amount_mm, self.amount_unit)
+        amt = format_amount_estimate(result.bucket, result.amount_mm, result.snow_cm, self.amount_unit)
         return f" (est {amt})" if amt else ""
 
     def _format_result(

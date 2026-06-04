@@ -34,8 +34,7 @@ from ..commands.rain_command import (
     analyze_precip_nowcast,
     decide_rain_notification,
     fetch_precip_series,
-    format_precip_amount,
-    format_snow_amount,
+    format_amount_estimate,
     join_location,
     precip_descriptor,
     reverse_geocode_region,
@@ -956,12 +955,12 @@ class WeatherService(BaseServicePlugin):
             self._cached_rain_location = join_location(city, suffix)
         location = f" near {self._cached_rain_location}" if self._cached_rain_location else ""
 
-        if not self.rain_nowcast_show_amount:
-            amt = None
-        elif result.bucket == "snow":
-            amt = format_snow_amount(result.snow_cm, self.rain_nowcast_amount_unit)
+        if self.rain_nowcast_show_amount:
+            amt = format_amount_estimate(
+                result.bucket, result.amount_mm, result.snow_cm, self.rain_nowcast_amount_unit
+            )
         else:
-            amt = format_precip_amount(result.amount_mm, self.rain_nowcast_amount_unit)
+            amt = None
         est = f" (est {amt})" if amt else ""
         if kind == "ending":
             return f"{emoji} Heads up — {ptype} ending in ~{result.minutes}min{est}{location}"

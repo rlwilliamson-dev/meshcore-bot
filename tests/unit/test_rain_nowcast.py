@@ -14,6 +14,7 @@ from modules.commands.rain_command import (
     analyze_precip_nowcast,
     city_display_name,
     decide_rain_notification,
+    format_amount_estimate,
     format_precip_amount,
     format_snow_amount,
     join_location,
@@ -451,6 +452,16 @@ def test_format_snow_amount():
     assert format_snow_amount(0.0, "in") is None
     assert format_snow_amount(None, "in") is None
     assert format_snow_amount(12.5, "mm") == "12.5 cm snow"   # metric shows cm
+
+
+def test_format_amount_estimate_per_bucket():
+    # rain/showers -> liquid; snow -> depth from snow_cm; freezing -> liquid + "ice".
+    assert format_amount_estimate("rain", 5.08, 0.0, "in") == "0.2 in"
+    assert format_amount_estimate("heavy_rain", 12.7, 0.0, "in") == "0.5 in"
+    assert format_amount_estimate("snow", 8.6, 7.0, "in") == "2.8 in snow"
+    assert format_amount_estimate("freezing", 2.54, 0.0, "in") == "0.1 in ice"
+    assert format_amount_estimate("freezing", 5.0, 0.0, "mm") == "5.0 mm ice"
+    assert format_amount_estimate("drizzle", 0.0, 0.0, "in") is None   # negligible -> no estimate
 
 
 # --- precip family filter (the !rain vs !snow engine) -----------------------
