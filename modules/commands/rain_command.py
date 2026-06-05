@@ -584,14 +584,14 @@ class RainCommand(BaseCommand):
 
     name = "rain"
     keywords = ["rain", "nowcast", "snow"]
-    description = "Rain nowcast: when precipitation starts or stops in the next couple hours"
+    description = "Rain/snow nowcast: when precip starts or stops in the next ~2h, with amount"
     category = "weather"
     requires_internet = True
     cooldown_seconds = 5
 
-    short_description = "Rain nowcast (when rain starts/stops) for a location"
-    usage = "rain [city|zipcode|lat,lon]"
-    examples = ["rain", "rain seattle", "rain 98101", "rain 47.6,-122.3"]
+    short_description = "Rain/snow nowcast (when precip starts/stops) for a location"
+    usage = "rain|snow [city|zipcode|lat,lon]"
+    examples = ["rain", "snow", "rain seattle", "snow 98101", "rain 47.6,-122.3"]
     parameters = [
         {"name": "location", "description": "Optional: city, US ZIP, or lat,lon. Default: companion or bot location."}
     ]
@@ -886,6 +886,20 @@ class RainCommand(BaseCommand):
             "commands.rain.continuing",
             emoji=emoji, ptype=ptype, window=self._window_label(), location=location_label,
         ) + self._amount_suffix(result)
+
+    def get_help_text(self, message: Any = None) -> str:
+        """Help tailored to the keyword asked about: 'help snow' talks snow
+        (depth), 'help rain'/'help nowcast' talk rain (amount). Falls back to
+        the rain variant when the queried word can't be determined."""
+        word = "rain"
+        content = (getattr(message, "content", "") or "").strip()
+        if content.startswith("!"):
+            content = content[1:].strip()
+        parts = content.split()
+        if len(parts) >= 2:
+            word = parts[1].lower()
+        key = "commands.rain.help_snow" if word == "snow" else "commands.rain.help_rain"
+        return self.translate(key)
 
     async def execute(self, message: MeshMessage) -> bool:
         content = message.content.strip()
