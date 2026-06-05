@@ -6,8 +6,9 @@ Open-Meteo's 15-minutely precipitation forecast. Works worldwide, no API key.
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import requests
@@ -268,6 +269,50 @@ def format_amount_estimate(
     return amt
 
 
+def episode_probability_temp(series: dict, result: "NowcastResult") -> tuple[Optional[int], Optional[int]]:
+    """Precip probability (%) and 2 m temperature (°F) at the episode's defining
+    moment — the current bucket when precipitating now, else the start bucket.
+    Returns (None, None) for dry_clear or when the data is missing.
+    """
+    if result is None or result.state == "dry_clear":
+        return None, None
+    times = series.get("times") or []
+    probs = series.get("prob") or []
+    temps = series.get("temp") or []
+    try:
+        now = datetime.fromisoformat(series["now"])
+    except (TypeError, ValueError, KeyError):
+        return None, None
+    if result.state in ("raining_stopping", "raining_continuing"):
+        target = now
+    else:  # dry_incoming: align with when precip begins
+        target = now + timedelta(minutes=result.minutes or 0)
+    best_i: Optional[int] = None
+    best_d: Optional[float] = None
+    for i, t in enumerate(times):
+        try:
+            tt = datetime.fromisoformat(t)
+        except (TypeError, ValueError):
+            continue
+        d = abs((tt - target).total_seconds())
+        if best_d is None or d < best_d:
+            best_d, best_i = d, i
+    if best_i is None:
+        return None, None
+    prob = probs[best_i] if best_i < len(probs) else None
+    tc = temps[best_i] if best_i < len(temps) else None
+    prob_pct = int(round(prob)) if prob is not None else None
+    temp_f = int(round(tc * 9 / 5 + 32)) if tc is not None else None
+    return prob_pct, temp_f
+
+
+# Short-lived cache of fetched series, keyed by rounded coords + model, so the
+# command and the proactive poll can reuse one fetch instead of re-hitting
+# Open-Meteo. Bounded; entries expire by the caller's cache_ttl.
+_SERIES_CACHE: dict[tuple, tuple[float, dict]] = {}
+_SERIES_CACHE_CAP = 64
+
+
 def fetch_precip_series(
     session: Any,
     lat: float,
@@ -276,22 +321,32 @@ def fetch_precip_series(
     weather_model: str = "",
     timeout: int = 10,
     logger: Any = None,
+    cache_ttl: float = 0.0,
 ) -> Optional[dict]:
     """Fetch + normalize an Open-Meteo precipitation series using `session`.
 
     Prefers 15-minutely data; falls back to hourly when a model doesn't provide
-    minutely_15. The caller owns the session's lifecycle. Returns a dict with
-    keys times, precip, snow, codes, now, current_precip, current_code, step — or
-    None on any error. Precipitation is requested in mm (detection is
-    unit-independent); snowfall comes in cm (Open-Meteo's snow-depth estimate).
+    minutely_15. The caller owns the session's lifecycle. Returns a dict with keys
+    times, precip, snow, prob, temp, codes, now, current_precip, current_code,
+    step — or None on any error. Precipitation is requested in mm (detection is
+    unit-independent); snowfall in cm; prob is precip probability (%); temp is
+    2 m temperature (°C). When cache_ttl > 0, a fresh prior result for the same
+    rounded location is reused.
     """
+    cache_key = (round(lat, 2), round(lon, 2), weather_model)
+    if cache_ttl > 0:
+        hit = _SERIES_CACHE.get(cache_key)
+        if hit is not None and (time.time() - hit[0]) < cache_ttl:
+            return hit[1]
+
     api_url = "https://api.open-meteo.com/v1/forecast"
+    variables = "precipitation,snowfall,weather_code,precipitation_probability,temperature_2m"
     params: dict[str, Any] = {
         "latitude": lat,
         "longitude": lon,
-        "minutely_15": "precipitation,snowfall,weather_code",
-        "hourly": "precipitation,snowfall,weather_code",
-        "current": "precipitation,snowfall,weather_code",
+        "minutely_15": variables,
+        "hourly": variables,
+        "current": "precipitation,snowfall,weather_code,temperature_2m",
         "precipitation_unit": "mm",
         "timezone": "auto",
         "forecast_days": 2,  # cover the window even when "now" is late in the day
@@ -316,35 +371,41 @@ def fetch_precip_series(
     if not now:
         return None
 
+    common = {
+        "now": now,
+        "current_precip": current.get("precipitation"),
+        "current_code": current.get("weather_code"),
+    }
+    series: Optional[dict] = None
     m15 = data.get("minutely_15", {}) or {}
     m_times = m15.get("time") or []
     m_precip = m15.get("precipitation") or []
     if m_times and any(p is not None for p in m_precip):
-        return {
-            "times": m_times,
-            "precip": m_precip,
+        series = {
+            "times": m_times, "precip": m_precip,
             "snow": m15.get("snowfall") or [],
-            "codes": m15.get("weather_code") or [],
-            "now": now,
-            "current_precip": current.get("precipitation"),
-            "current_code": current.get("weather_code"),
-            "step": 15,
+            "prob": m15.get("precipitation_probability") or [],
+            "temp": m15.get("temperature_2m") or [],
+            "codes": m15.get("weather_code") or [], "step": 15, **common,
+        }
+    else:
+        hourly = data.get("hourly", {}) or {}
+        h_times = hourly.get("time") or []
+        if not h_times:
+            return None
+        series = {
+            "times": h_times, "precip": hourly.get("precipitation") or [],
+            "snow": hourly.get("snowfall") or [],
+            "prob": hourly.get("precipitation_probability") or [],
+            "temp": hourly.get("temperature_2m") or [],
+            "codes": hourly.get("weather_code") or [], "step": 60, **common,
         }
 
-    hourly = data.get("hourly", {}) or {}
-    h_times = hourly.get("time") or []
-    if not h_times:
-        return None
-    return {
-        "times": h_times,
-        "precip": hourly.get("precipitation") or [],
-        "snow": hourly.get("snowfall") or [],
-        "codes": hourly.get("weather_code") or [],
-        "now": now,
-        "current_precip": current.get("precipitation"),
-        "current_code": current.get("weather_code"),
-        "step": 60,
-    }
+    if cache_ttl > 0:
+        if len(_SERIES_CACHE) >= _SERIES_CACHE_CAP:
+            _SERIES_CACHE.pop(next(iter(_SERIES_CACHE)))
+        _SERIES_CACHE[cache_key] = (time.time(), series)
+    return series
 
 
 @dataclass
@@ -618,6 +679,19 @@ class RainCommand(BaseCommand):
         self.amount_unit = self.bot.config.get(
             "Rain_Command", "amount_unit", fallback="in"
         ).strip().lower()
+        # Show precip probability "(…, 70%)" and a borderline-temperature tag
+        # "34°F" (only when ~30-38°F, where rain/snow/ice is in doubt).
+        self.show_probability = self.get_config_value(
+            "Rain_Command", "show_probability", fallback=True, value_type="bool"
+        )
+        self.show_temp = self.get_config_value(
+            "Rain_Command", "show_temp", fallback=True, value_type="bool"
+        )
+        # Reuse a fetched series for this many seconds (shared with the proactive
+        # poll); 0 disables. Short so the nowcast's "now" stays fresh.
+        self.cache_ttl = self.get_config_value(
+            "Rain_Command", "cache_seconds", fallback=300, value_type="int"
+        )
         # Display names. The bot's own location prefers [Weather] default_city +
         # default_state; other coordinates are reverse-geocoded (state for US,
         # country otherwise). Results cached.
@@ -824,6 +898,7 @@ class RainCommand(BaseCommand):
             return fetch_precip_series(
                 session, lat, lon,
                 weather_model=self.weather_model, timeout=self.url_timeout, logger=self.logger,
+                cache_ttl=self.cache_ttl,
             )
         finally:
             session.close()
@@ -839,22 +914,31 @@ class RainCommand(BaseCommand):
         b = bucket or "rain"
         return self.translate(f"commands.rain.precip_types.{b}")
 
-    def _amount_suffix(self, result: NowcastResult) -> str:
-        """' (est 0.2 in)' rain, ' (est 1.5 in snow)', ' (est 0.1 in ice)', else ''."""
-        if not self.show_amount:
-            return ""
-        amt = format_amount_estimate(result.bucket, result.amount_mm, result.snow_cm, self.amount_unit)
-        return f" (est {amt})" if amt else ""
+    def _detail_suffix(self, result: NowcastResult, prob: Optional[int], temp_f: Optional[int]) -> str:
+        """Trailing detail: ' (est 0.2 in, 70%) 34°F' — amount + probability in the
+        parens, plus a temperature tag only when borderline (~30-38°F)."""
+        parts: list[str] = []
+        if self.show_amount:
+            amt = format_amount_estimate(result.bucket, result.amount_mm, result.snow_cm, self.amount_unit)
+            if amt:
+                parts.append(f"est {amt}")
+        if self.show_probability and prob is not None:
+            parts.append(f"{prob}%")
+        paren = f" ({', '.join(parts)})" if parts else ""
+        temp = f" {temp_f}°F" if (self.show_temp and temp_f is not None and 30 <= temp_f <= 38) else ""
+        return paren + temp
 
     def _format_result(
         self, result: NowcastResult, location_label: str,
         *, asked_word: Optional[str] = None, mismatch: bool = False,
+        prob: Optional[int] = None, temp_f: Optional[int] = None,
     ) -> str:
         """Render a NowcastResult into a single mesh-friendly line.
 
         ``asked_word`` is the precip the user asked for ("rain"/"snow"); when
         ``mismatch`` is set the result is the *other* type, rendered as
         "No <asked>, but <actual> ..." so a !snow that finds rain still helps.
+        ``prob``/``temp_f`` add a probability and borderline-temperature tag.
         """
         emoji = _BUCKET_EMOJI.get(result.bucket or "rain", "🌧️")
         if result.state == "dry_clear":
@@ -875,17 +959,33 @@ class RainCommand(BaseCommand):
                 "commands.rain.starting",
                 emoji=emoji, ptype=ptype, minutes=result.minutes,
                 location=location_label, extra=extra,
-            ) + self._amount_suffix(result)
+            ) + self._detail_suffix(result, prob, temp_f)
         if result.state == "raining_stopping":
             return self.translate(
                 "commands.rain.stopping",
                 emoji=emoji, ptype=ptype, minutes=result.minutes, location=location_label,
-            ) + self._amount_suffix(result)
+            ) + self._detail_suffix(result, prob, temp_f)
         # raining_continuing
         return self.translate(
             "commands.rain.continuing",
             emoji=emoji, ptype=ptype, window=self._window_label(), location=location_label,
-        ) + self._amount_suffix(result)
+        ) + self._detail_suffix(result, prob, temp_f)
+
+    def _format_changeover(self, rain_r: NowcastResult, snow_r: NowcastResult, location_label: str) -> str:
+        """A rain<->snow transition line, e.g. '🌧️→🌨️ Rain now → snow in ~60min
+        for X' — whichever type comes first leads."""
+        def start(r: NowcastResult) -> int:
+            return 0 if r.state in ("raining_stopping", "raining_continuing") else (r.minutes or 0)
+        first_r, second_r = (rain_r, snow_r) if start(rain_r) <= start(snow_r) else (snow_r, rain_r)
+        when = self.translate("commands.rain.now") if start(first_r) == 0 else f"in ~{start(first_r)}min"
+        return self.translate(
+            "commands.rain.changeover",
+            from_emoji=_BUCKET_EMOJI.get(first_r.bucket or "rain", "🌧️"),
+            to_emoji=_BUCKET_EMOJI.get(second_r.bucket or "snow", "🌨️"),
+            first=self._ptype(first_r.bucket), when=when,
+            second=self._ptype(second_r.bucket).lower(),
+            minutes=start(second_r), location=location_label,
+        )
 
     def get_help_text(self, message: Any = None) -> str:
         """Help tailored to the keyword asked about: 'help snow' talks snow
@@ -908,18 +1008,10 @@ class RainCommand(BaseCommand):
         parts = content.split()
         location: Optional[str] = " ".join(parts[1:]).strip() if len(parts) >= 2 else None
 
-        # Which keyword triggered us sets the precip we're asked about. !snow hunts
-        # snow first, !rain hunts rain; !nowcast (or anything else) has no preference.
+        # Which keyword triggered us sets the precip we're asked about. !snow leads
+        # with snow, !rain with rain; !nowcast (or anything else) has no preference.
         mode = parts[0].lower() if parts else "rain"
-        if mode == "snow":
-            asked_family: Optional[frozenset[str]] = SNOW_FAMILY
-            asked_word: Optional[str] = "snow"
-        elif mode == "nowcast":
-            asked_family = None
-            asked_word = None
-        else:
-            asked_family = RAIN_FAMILY
-            asked_word = "rain"
+        asked_word: Optional[str] = "snow" if mode == "snow" else (None if mode == "nowcast" else "rain")
 
         # Bare country/US state (e.g. "france", "texas") -> default to its capital
         # and append a heads-up, since one centroid point isn't representative.
@@ -970,22 +1062,30 @@ class RainCommand(BaseCommand):
                 snow=series.get("snow"), family=fam,
             )
 
-        # Look for the asked-for precip first; if none is coming, fall back to
-        # whatever IS (rendered with a "No <asked>, but ..." lead).
-        result = run(asked_family)
-        if result is None:
+        # Analyze each precip family. Both present -> a changeover line; otherwise
+        # the asked-for type, falling back to the other with a "No <asked>, but …".
+        rain_r = run(RAIN_FAMILY)
+        snow_r = run(SNOW_FAMILY)
+        if rain_r is None or snow_r is None:
             await self.send_response(message, self.translate("commands.rain.error_fetching"))
             return True
-        mismatch = False
-        if asked_family is not None and result.state == "dry_clear":
-            other = run(None)
-            if other is not None and other.state != "dry_clear":
-                result, mismatch = other, True
+        rain_ok = rain_r.state != "dry_clear"
+        snow_ok = snow_r.state != "dry_clear"
+        label = location_label or f"{lat:.1f},{lon:.1f}"
 
-        response = self._format_result(
-            result, location_label or f"{lat:.1f},{lon:.1f}",
-            asked_word=asked_word, mismatch=mismatch,
-        )
+        if rain_ok and snow_ok:
+            response = self._format_changeover(rain_r, snow_r, label)
+        else:
+            if asked_word == "snow":
+                result, mismatch = (snow_r, False) if snow_ok else ((rain_r, True) if rain_ok else (snow_r, False))
+            elif asked_word == "rain":
+                result, mismatch = (rain_r, False) if rain_ok else ((snow_r, True) if snow_ok else (rain_r, False))
+            else:  # nowcast: no type preference
+                result, mismatch = (rain_r if rain_ok else snow_r), False
+            prob, temp_f = episode_probability_temp(series, result)
+            response = self._format_result(
+                result, label, asked_word=asked_word, mismatch=mismatch, prob=prob, temp_f=temp_f,
+            )
         if region_note:
             response = f"{response} {region_note}"
         max_len = self.get_max_message_length(message)

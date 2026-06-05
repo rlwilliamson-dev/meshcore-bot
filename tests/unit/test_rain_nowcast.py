@@ -14,6 +14,7 @@ from modules.commands.rain_command import (
     analyze_precip_nowcast,
     city_display_name,
     decide_rain_notification,
+    episode_probability_temp,
     format_amount_estimate,
     format_precip_amount,
     format_snow_amount,
@@ -452,6 +453,30 @@ def test_format_snow_amount():
     assert format_snow_amount(0.0, "in") is None
     assert format_snow_amount(None, "in") is None
     assert format_snow_amount(12.5, "mm") == "12.5 cm snow"   # metric shows cm
+
+
+def test_episode_probability_temp_dry_incoming():
+    # Rain starts at 14:30 (+30min) -> prob/temp read at that bucket.
+    s = {"times": TIMES_15, "now": NOW,
+         "prob": [10, 20, 80, 80, 30, 0, 0, 0, 0],
+         "temp": [20, 20, 1.0, 1.0, 5, 5, 5, 5, 5]}  # 1.0C -> 34F
+    r = NowcastResult(state="dry_incoming", minutes=30, bucket="rain")
+    assert episode_probability_temp(s, r) == (80, 34)
+
+
+def test_episode_probability_temp_raining_now():
+    s = {"times": TIMES_15, "now": NOW,
+         "prob": [90, 90, 0, 0, 0, 0, 0, 0, 0],
+         "temp": [0.0, 0.0, 0, 0, 0, 0, 0, 0, 0]}  # 0C -> 32F at "now" bucket
+    r = NowcastResult(state="raining_continuing", bucket="rain")
+    assert episode_probability_temp(s, r) == (90, 32)
+
+
+def test_episode_probability_temp_dry_clear_and_missing():
+    s = {"times": TIMES_15, "now": NOW, "prob": [0] * 9, "temp": [10] * 9}
+    assert episode_probability_temp(s, NowcastResult(state="dry_clear")) == (None, None)
+    s2 = {"times": TIMES_15, "now": NOW, "prob": [], "temp": []}
+    assert episode_probability_temp(s2, NowcastResult(state="dry_incoming", minutes=30, bucket="rain")) == (None, None)
 
 
 def test_format_amount_estimate_per_bucket():

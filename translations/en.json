@@ -394,6 +394,8 @@
       "stopping": "{emoji} {ptype} easing in ~{minutes}min for {location}",
       "continuing": "{emoji} {ptype} steady for {window}+ in {location}",
       "clear": "☀️ No {precip} expected in next {window} for {location}",
+      "changeover": "{from_emoji}→{to_emoji} {first} {when} → {second} in ~{minutes}min for {location}",
+      "now": "now",
       "duration_for": " (~{duration}min)",
       "duration_open": " (steady)",
       "error_fetching": "Error fetching rain nowcast data",
