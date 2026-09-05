@@ -722,8 +722,11 @@ class WxCommand(BaseCommand):
         location = ' '.join(location_parts).strip()
 
         if not location:
-            # Bare "wx alert(s)" -> alerts for the default city, not usage.
-            if show_full_alerts and self.default_city:
+            # An option with no location ("wx hourly", "wx tomorrow", "wx 7d",
+            # "wx alert(s)") means the default city, same as a bare "wx". The option
+            # is the only token after the command, so it gets consumed above and
+            # leaves nothing to geocode; without this we'd answer with usage.
+            if self.default_city:
                 location = self.default_city + (f", {self.default_state}" if self.default_state else "")
             else:
                 await self.send_response(message, self.translate('commands.wx.usage'))

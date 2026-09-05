@@ -362,3 +362,47 @@ def test_wx_multiword_city_is_not_mistaken_for_a_bad_option():
     cmd, captured = _build_wx()
     _run_wx(cmd, captured, "wx nashville, tn")
     cmd.city_to_lat_lon.assert_called()
+
+
+# --- option with no location falls back to the default city ------------------
+#
+# "wx hourly" is two tokens, so it never reached the bare-"wx" default-location
+# branch. The option was consumed as the forecast type, nothing was left to
+# geocode, and the reply was the usage string. Only "alert(s)" had a fallback.
+
+def _build_wx_with_default_city():
+    bot, captured = _make_bot(weather_overrides={"default_city": "Nashville"})
+    cmd = WxCommand(bot)
+    cmd.city_to_lat_lon = Mock(
+        side_effect=lambda loc: _WX_CITY_DB.get(loc.strip().lower(), (None, None, None))
+    )
+    cmd.get_noaa_weather = Mock(return_value=("Sunny 72°F", {"properties": {}}))
+    cmd.get_noaa_hourly_weather = Mock(return_value=([], {"properties": {}}))
+    cmd.format_hourly_forecast = Mock(return_value="12PM ☀️ 92°")
+    cmd.get_weather_alerts_noaa = Mock(return_value=cmd.NO_ALERTS)
+    return cmd, captured
+
+
+def test_wx_option_without_location_uses_default_city():
+    for content in ("wx hourly", "wx tomorrow", "wx 7d", "wx 3", "wx alerts"):
+        cmd, captured = _build_wx_with_default_city()
+        assert asyncio.run(cmd.execute(_msg(content))) is True
+        cmd.city_to_lat_lon.assert_called_once_with("Nashville, TN"), content
+        assert captured, f"{content} produced no reply"
+        assert "wx <city|ZIP" not in captured[0], f"{content} fell through to usage"
+
+
+def test_wx_option_without_location_still_selects_that_forecast_type():
+    # The option must survive the default-city fallback, not be dropped with it.
+    cmd, _ = _build_wx_with_default_city()
+    assert asyncio.run(cmd.execute(_msg("wx hourly"))) is True
+    cmd.get_noaa_hourly_weather.assert_called_once()
+    cmd.get_noaa_weather.assert_not_called()
+
+
+def test_wx_option_without_location_and_no_default_city_shows_usage():
+    # No default city configured: usage is the correct answer, nothing to fall back to.
+    cmd, captured = _build_wx()  # default_city is "" in the shared fixture
+    assert asyncio.run(cmd.execute(_msg("wx hourly"))) is True
+    assert "wx <city|ZIP" in captured[0]
+    cmd.city_to_lat_lon.assert_not_called()
