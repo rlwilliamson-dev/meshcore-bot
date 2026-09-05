@@ -52,8 +52,8 @@
       "help": "Responds to 'test' or 't' with connection info"
     },
     "wx": {
-      "description": "Get weather information for a zip code (usage: wx 12345)",
-      "usage": "Usage: wx <zipcode|city> - Example: wx 12345 or wx seattle or wx paris, tx",
+      "description": "US weather (NOAA): city, ZIP, or lat,lon. Add tomorrow | Nd | hourly | alerts. Outside the US? use gwx",
+      "usage": "wx <city|ZIP|lat,lon> [tomorrow|Nd|hourly|alerts] · e.g. wx nashville 7d · outside US: gwx",
       "subcommands": [
         {
           "name": "tomorrow",
@@ -75,6 +75,7 @@
       "error_fetching": "Error fetching weather data from NOAA",
       "no_location_zipcode": "Could not find location for zipcode {location}",
       "no_location_city": "Could not find city '{location}' in {state}",
+      "redirect_gwx": "🌍 {location} is outside NOAA's US coverage — try: gwx {location}",
       "error": "Error getting weather data: {error}",
       "alerts": "{count} alerts: {text}",
       "tomorrow_not_available": "Tomorrow's forecast not available",
@@ -88,9 +89,23 @@
       "mqtt_weather_payload_error": "MQTT weather payload error: {detail}"
     },
     "gwx": {
-      "description": "Get weather information for any global location (usage: gwx Tokyo)",
-      "help": "Usage: gwx <location> - Get weather for any global location (city, country, or coordinates)",
-      "usage": "Usage: gwx <location> - Example: gwx Tokyo or gwx Paris, France",
+      "description": "Worldwide weather (Open-Meteo): city, country, or lat,lon. Add tomorrow | Nd | hourly. e.g. gwx tokyo",
+      "help": "gwx <city|country|lat,lon> [tomorrow|Nd|hourly] · worldwide weather · e.g. gwx tokyo, gwx tokyo hourly",
+      "usage": "gwx <city|country|lat,lon> [tomorrow|Nd|hourly] · e.g. gwx tokyo hourly",
+      "subcommands": [
+        {
+          "name": "tomorrow",
+          "description": "Get tomorrow's forecast"
+        },
+        {
+          "name": "Nd",
+          "description": "Get N-day forecast (e.g. 7d, 10d; also 7-day, 7, or 2–16)"
+        },
+        {
+          "name": "hourly",
+          "description": "Get hourly forecast"
+        }
+      ],
       "error_fetching": "Error fetching weather data",
       "error_fetching_api": "Error fetching weather data from Open-Meteo",
       "no_location": "Could not find location '{location}'",
@@ -99,6 +114,8 @@
       "tomorrow_error": "Error formatting tomorrow's forecast",
       "multiday_not_available": "{num_days}-day forecast not available",
       "multiday_error": "Error formatting {num_days}-day forecast",
+      "hourly_prefix": "Hourly:",
+      "hourly_not_available": "Hourly forecast not available",
       "mqtt_forecast_not_supported": "Extended forecast is not available for MQTT weather sources",
       "mqtt_weather_no_subscriber": "MQTT weather subscriber is not active (enable [MqttWeather] and custom.mqtt_weather.* topics)",
       "mqtt_weather_no_data": "No MQTT weather message received for this topic yet",

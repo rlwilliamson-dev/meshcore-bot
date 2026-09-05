@@ -35,13 +35,13 @@ from ..commands.rain_command import (
     decide_rain_notification,
     episode_probability_temp,
     fetch_precip_series,
+    fetch_precip_series_nws,
     format_amount_estimate,
-    join_location,
     precip_descriptor,
-    reverse_geocode_region,
 )
+from ..location_format import join_location, reverse_geocode_region
 from ..url_shortener import shorten_url
-from ..utils import format_temperature_high_low, get_config_timezone
+from ..utils import get_config_timezone
 from .base_service import BaseServicePlugin
 
 # LOCAL MOD (not upstream): max body bytes per mesh message for chunked alerts.
@@ -169,6 +169,23 @@ class WeatherService(BaseServicePlugin):
 
         # Track last alert check time to only send new alerts
         self.last_alert_check_time: Optional[float] = None
+        # Alert poll keys off the bot's NWS county zone (storm-based polygons often
+        # miss the exact GPS point even when the county is warned). Config override,
+        # else auto-resolved from position on the first poll and cached.
+        self._alert_zone = self.bot.config.get('Weather_Service', 'alert_zone', fallback='').strip()
+        self._alert_zone_resolved = bool(self._alert_zone)
+        # Public forecast zone (e.g. "TNZ027") polled ALONGSIDE the county zone:
+        # zone-based products (Flood/Winter/Wind Watch, Heat Advisory, Special
+        # Weather Statement) are tagged to the forecast zone, NOT the county zone,
+        # so a county-only poll silently misses them. Config override, else
+        # auto-resolved from the same /points lookup as the county zone.
+        self._alert_zone_fc = self.bot.config.get('Weather_Service', 'alert_forecast_zone', fallback='').strip()
+        # Bot's county name (e.g. "Davidson") — alerts lead with it so the channel
+        # can tell the alert covers their county. Config override, else auto-resolved.
+        self._alert_county = self.bot.config.get('Weather_Service', 'alert_county', fallback='').strip()
+        # Adjacent county names (set) so multi-county alerts name the NEARBY affected
+        # counties and collapse far ones. Resolved lazily (config or Census file).
+        self._alert_neighbors: Optional[set] = None
 
         # Background tasks
         self._alerts_task: Optional[asyncio.Task] = None
@@ -177,6 +194,19 @@ class WeatherService(BaseServicePlugin):
         self._rain_task: Optional[asyncio.Task] = None
         self._forecast_scheduler: Optional[BackgroundScheduler] = None
         self._running = False
+        # Serialized proactive-send queue: ALL proactive channel pushes (rain,
+        # alerts, daily) drain through one consumer so they never overlap — each
+        # flood finishes before the next goes out, across both channels. Gap is the
+        # spacing between any two sends (tunable; default 8 s).
+        self._send_queue: Optional[asyncio.Queue] = None
+        self._send_drain_task: Optional[asyncio.Task] = None
+        self._proactive_send_gap = self.bot.config.getint(
+            'Weather_Service', 'proactive_send_gap_seconds', fallback=8)
+        # One-time delay before the FIRST proactive send after start, so the radio
+        # finishes booting + clears its startup RX backlog (a too-early first send
+        # reports "sent" but never propagates — observed after a restart).
+        self._proactive_send_warmup = self.bot.config.getint(
+            'Weather_Service', 'proactive_send_warmup_seconds', fallback=20)
 
         # Rain nowcast episode state (dedup): which notice has fired for the
         # current rain episode, and the last-push timestamps (cooldown backstop).
@@ -291,6 +321,11 @@ class WeatherService(BaseServicePlugin):
         self._running = True
         self.logger.info("Starting weather service")
 
+        # Serialized send drain — start it before any poller so proactive pushes
+        # (rain/alerts/daily) queue through one consumer, spaced so floods don't collide.
+        self._send_queue = asyncio.Queue()
+        self._send_drain_task = asyncio.create_task(self._send_drain_loop())
+
         # Setup scheduled daily forecast
         if self.use_sunrise_sunset:
             # For sunrise/sunset, use a background task that reschedules daily
@@ -329,6 +364,11 @@ class WeatherService(BaseServicePlugin):
         self.logger.info("Stopping weather service")
 
         # Cancel background tasks
+        if self._send_drain_task:
+            self._send_drain_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._send_drain_task
+
         if self._alerts_task:
             self._alerts_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -508,8 +548,9 @@ class WeatherService(BaseServicePlugin):
             forecast_text = await self._get_weather_forecast()
 
             if forecast_text and forecast_text != "Error fetching weather data":
-                # LOCAL MOD: post to every weather channel.
-                await self._send_to_channels(self._weather_channels, f"🌤️ Daily Weather: {forecast_text}")
+                # LOCAL MOD: post to every weather channel. The "🌤️ Daily ·"
+                # marker is now baked into the formatted text (B+ redesign).
+                await self._send_to_channels(self._weather_channels, forecast_text)
                 self._last_forecast_date = today
                 self.logger.info(f"Daily weather forecast sent to {self._weather_channels}")
             else:
@@ -559,18 +600,11 @@ class WeatherService(BaseServicePlugin):
             if not current or not daily:
                 return "No forecast data available"
 
-            # Current conditions
-            temp = int(current.get('temperature_2m', 0))
-            weather_code = current.get('weather_code', 0)
-            wind_speed = int(current.get('wind_speed_10m', 0))
-            wind_direction = self._degrees_to_direction(current.get('wind_direction_10m', 0))
-
-            # Get weather description and emoji
-            weather_desc = self._get_weather_description(weather_code)
-            weather_emoji = self._get_weather_emoji(weather_code)
-
-            # Temperature unit symbol
+            # ---- Daily push, redesigned "B+" format (mirrors the wx/gwx look) ----
+            # Header: scheduled-push marker + location + current temp; then a
+            # "today" row and a "tomorrow" row built from the Open-Meteo daily block.
             temp_symbol = "°F" if self.temperature_unit == 'fahrenheit' else "°C"
+            now_temp = int(current.get('temperature_2m', 0))
 
             # Get location name (cached to avoid repeated API calls)
             if self._cached_location_name is None:
@@ -605,55 +639,52 @@ class WeatherService(BaseServicePlugin):
             else:
                 location_name = self._cached_location_name
 
-            # Format current forecast
-            forecast_text = f"{location_name}: {weather_emoji}{weather_desc} {temp}{temp_symbol}"
-            if wind_speed > 0:
-                wind_dir_str = f"{wind_direction}" if wind_direction else ""
-                forecast_text += f" {wind_dir_str}{wind_speed}{self.wind_speed_unit}"
+            header = f"🌤️ Daily · {location_name}  now {now_temp}{temp_symbol}"
 
-            today_high = int(daily['temperature_2m_max'][0])
-            today_low = int(daily['temperature_2m_min'][0])
-            forecast_text += (
-                " | "
-                + format_temperature_high_low(
-                    self.bot.config, today_high, today_low, temp_symbol, self.logger
-                )
-            )
-
-            # Add tomorrow's forecast
-            daily_times = daily.get('time', [])
+            # today + tomorrow rows (clean look via the shared wx_format.day_row).
+            from ..wx_format import day_row
             daily_codes = daily.get('weather_code', [])
             daily_max = daily.get('temperature_2m_max', [])
             daily_min = daily.get('temperature_2m_min', [])
+            daily_pop = daily.get('precipitation_probability_max', [])
 
-            if len(daily_times) > 1 and len(daily_codes) > 1:
-                tomorrow_code = daily_codes[1]
-                tomorrow_max = int(daily_max[1]) if len(daily_max) > 1 else None
-                tomorrow_min = int(daily_min[1]) if len(daily_min) > 1 else None
-                tomorrow_desc = self._get_weather_description(tomorrow_code)
-                tomorrow_emoji = self._get_weather_emoji(tomorrow_code)
+            def _daily_row(label, idx, with_precip):
+                if idx >= len(daily_codes):
+                    return None
+                hi = int(daily_max[idx]) if idx < len(daily_max) and daily_max[idx] is not None else None
+                lo = int(daily_min[idx]) if idx < len(daily_min) and daily_min[idx] is not None else None
+                if hi is None and lo is None:
+                    return None
+                row = day_row(
+                    label,
+                    self._get_weather_emoji(daily_codes[idx]),
+                    self._get_weather_description(daily_codes[idx]),
+                    hi,
+                    lo,
+                )
+                if with_precip:
+                    pop = daily_pop[idx] if idx < len(daily_pop) else None
+                    try:
+                        if pop is not None and int(pop) >= 15:
+                            row += f" {int(pop)}%"
+                    except (TypeError, ValueError):
+                        pass
+                return row
 
-                if tomorrow_max is not None:
-                    if tomorrow_min is not None and tomorrow_min != tomorrow_max:
-                        hl = format_temperature_high_low(
-                            self.bot.config,
-                            tomorrow_max,
-                            tomorrow_min,
-                            temp_symbol,
-                            self.logger,
-                        )
-                        forecast_text += f" | Tomorrow: {tomorrow_emoji}{tomorrow_desc} {hl}"
-                    else:
-                        hl = format_temperature_high_low(
-                            self.bot.config,
-                            tomorrow_max,
-                            None,
-                            temp_symbol,
-                            self.logger,
-                        )
-                        forecast_text += f" | Tomorrow: {tomorrow_emoji}{tomorrow_desc} {hl}"
+            def _assemble(with_precip):
+                out = [header]
+                for label, idx in (("today", 0), ("tomorrow", 1)):
+                    row = _daily_row(label, idx, with_precip)
+                    if row:
+                        out.append(row)
+                return "\n".join(out)
 
-            return forecast_text
+            forecast = _assemble(with_precip=True)
+            # Safety: never exceed the channel body budget. Drop the precip tails
+            # (least-critical info) before a pathological dual-storm day overflows.
+            if len(forecast.encode("utf-8")) > ALERT_CHUNK_BYTES:
+                forecast = _assemble(with_precip=False)
+            return forecast
 
         except Exception as e:
             self.logger.error(f"Error getting weather forecast: {e}")
@@ -745,31 +776,143 @@ class WeatherService(BaseServicePlugin):
                 self.logger.error(f"Error in weather alerts polling loop: {e}")
                 await asyncio.sleep(60)  # Wait 1 minute on error before retrying
 
+    def _get_alert_zone(self) -> str:
+        """NWS county zone (e.g. 'TNC037') the alert poll queries — config override
+        or auto-resolved once from the bot's position and cached. Returns '' when
+        it can't be resolved, so the caller falls back to a point query.
+
+        Why a zone, not the GPS point: storm-based polygons (Severe Thunderstorm /
+        Tornado Warnings, etc.) frequently exclude the precise point even when the
+        county is warned, so a point query silently misses real warnings.
+        """
+        if self._alert_zone_resolved:
+            return self._alert_zone
+        self._alert_zone_resolved = True
+        try:
+            resp = self.api_session.get(
+                f"https://api.weather.gov/points/"
+                f"{round(self.my_position_lat, 4)},{round(self.my_position_lon, 4)}",
+                timeout=10,
+            )
+            if resp.ok:
+                props = resp.json().get('properties', {})
+                county_url = (props.get('county') or '').rstrip('/')
+                county = county_url.split('/')[-1]
+                # Grab the forecast zone from the same lookup (unless overridden) so
+                # the poll can also catch zone-based Watches/Advisories.
+                if not self._alert_zone_fc:
+                    fc = (props.get('forecastZone') or '').rstrip('/').split('/')[-1]
+                    if fc:
+                        self._alert_zone_fc = fc
+                if county:
+                    self._alert_zone = county
+                    # Also resolve the county NAME (e.g. "Davidson") so alerts can
+                    # lead with it — unless a config override is set.
+                    if not self._alert_county and county_url:
+                        try:
+                            cr = self.api_session.get(county_url, timeout=10)
+                            if cr.ok:
+                                self._alert_county = (cr.json().get('properties', {}).get('name') or '').strip()
+                        except Exception:
+                            pass
+                    self.logger.info(
+                        f"Weather alerts: polling NWS county zone {county}"
+                        + (f" ({self._alert_county})" if self._alert_county else "")
+                    )
+        except Exception as e:
+            self.logger.debug(f"Could not resolve alert zone ({e}); using point query")
+        return self._alert_zone
+
+    def _alert_zone_query(self) -> str:
+        """Comma-joined NWS zones the alert poll queries: the county zone (catches
+        storm-based county warnings — Tornado / Severe Tstorm / Flash Flood) AND the
+        public forecast zone (catches zone-based products — Flood/Winter/Wind Watch,
+        Heat Advisory, Special Weather Statement — which are NOT tagged to the county
+        zone). '' when neither resolves, so the caller falls back to a point query.
+        The NWS active feed accepts comma-separated zones and de-dupes overlap.
+        """
+        county = self._get_alert_zone()  # resolves + caches both county & forecast
+        zones = [z for z in (county, self._alert_zone_fc) if z]
+        return ",".join(dict.fromkeys(zones))  # order-preserving de-dupe
+
+    def _get_alert_neighbors(self) -> set:
+        """County names adjacent to the bot's county (e.g. {'Cheatham', 'Robertson', …})
+        so a multi-county alert names the NEARBY affected counties and collapses the
+        far ones. Config override (`alert_neighbor_counties`), else the US Census
+        county-adjacency file fetched once and cached in memory. Empty set on failure
+        (the alert then just leads with the home county).
+        """
+        if self._alert_neighbors is not None:
+            return self._alert_neighbors
+        override = self.bot.config.get('Weather_Service', 'alert_neighbor_counties', fallback='').strip()
+        if override:
+            self._alert_neighbors = {c.strip() for c in override.split(',') if c.strip()}
+            return self._alert_neighbors
+        county = self._alert_county
+        state = (self._alert_zone or '')[:2]  # 'TNC037' -> 'TN'
+        if not county or not state:
+            return set()  # not resolvable yet — don't cache, retry on the next alert
+        neighbors: set = set()
+        try:
+            resp = self.api_session.get(
+                "https://www2.census.gov/geo/docs/reference/county_adjacency.txt", timeout=20
+            )
+            if resp.ok:
+                target = f"{county} County, {state}"
+                cur = None
+                for line in resp.text.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) >= 4 and parts[0].strip():
+                        cur = parts[0].strip().strip('"')
+                    if cur == target and len(parts) >= 3:
+                        nb = parts[2].strip().strip('"')
+                        if nb and nb != target:
+                            name = (nb.rsplit(" County,", 1)[0] if " County," in nb else nb.split(",")[0]).strip()
+                            if name:
+                                neighbors.add(name)
+                    elif cur and cur != target and neighbors:
+                        break  # past our county's block
+                self.logger.info(f"Alert neighbor counties for {county}: {sorted(neighbors)}")
+        except Exception as e:
+            self.logger.debug(f"Could not resolve county neighbors ({e})")
+        self._alert_neighbors = neighbors
+        return neighbors
+
     async def _check_weather_alerts(self) -> None:
         """Check for new weather alerts (US-only via NOAA API).
 
         Note: Open-Meteo doesn't provide weather alerts, so we use NOAA which is US-only.
         For international locations, alerts will not be available.
-        Only sends alerts that were issued since the last check.
+        On the first poll after startup it announces all currently-active alerts
+        (so an alert already in effect when the bot starts isn't missed); after that,
+        only alerts issued since the previous check.
         """
         try:
             # Get current time for this check
             current_check_time = time.time()
 
-            # Calculate time window: only alerts issued since last check (or last polling interval if first check)
-            if self.last_alert_check_time is None:
-                # First check: only get alerts from the last polling interval
-                time_window_start = current_check_time - self.poll_weather_alerts_interval
-            else:
-                # Subsequent checks: only get alerts since last check
-                time_window_start = self.last_alert_check_time
+            # On the FIRST poll after (re)start, announce everything currently active
+            # (the active feed only returns in-effect alerts) regardless of issue age —
+            # otherwise an alert already active at startup (e.g. an ongoing Flash Flood
+            # Warning) is silently never announced. Subsequent polls only pick up alerts
+            # issued since the previous check.
+            first_check = self.last_alert_check_time is None
+            time_window_start = (current_check_time - self.poll_weather_alerts_interval
+                                 if first_check else self.last_alert_check_time)
 
             # Round coordinates
             lat_rounded = round(self.my_position_lat, 4)
             lon_rounded = round(self.my_position_lon, 4)
 
-            # NOAA alerts API (US-only)
-            alert_url = f"https://api.weather.gov/alerts/active.atom?point={lat_rounded},{lon_rounded}"
+            # NOAA alerts API (US-only). Poll by the bot's COUNTY ZONE rather than
+            # the exact GPS point — storm-based polygons (Severe Thunderstorm /
+            # Tornado Warnings) often miss the precise point even when the county is
+            # warned. Falls back to the point query if the zone can't be resolved.
+            zone = self._alert_zone_query()
+            if zone:
+                alert_url = f"https://api.weather.gov/alerts/active.atom?zone={zone}"
+            else:
+                alert_url = f"https://api.weather.gov/alerts/active.atom?point={lat_rounded},{lon_rounded}"
 
             try:
                 alert_data = self.api_session.get(alert_url, timeout=10)
@@ -823,8 +966,9 @@ class WeatherService(BaseServicePlugin):
                         alert_issued_time = current_check_time
                         self.logger.debug(f"Could not parse time for alert {alert_id}, using current time")
 
-                    # Only include alerts issued since last check
-                    if alert_issued_time >= time_window_start:
+                    # First poll: send all active (backfill). Later polls: only alerts
+                    # issued since the previous check.
+                    if first_check or alert_issued_time >= time_window_start:
                         alerts.append(alert_dict)
                         self.seen_alert_ids.add(alert_id)
                         self.logger.debug(f"New alert {alert_id} issued at {datetime.fromtimestamp(alert_issued_time)}")
@@ -841,8 +985,7 @@ class WeatherService(BaseServicePlugin):
             # chunking for long ones, posted to every alerts channel.
             for alert in alerts:
                 try:
-                    body, short_url = await self._format_alert_full(alert)
-                    chunks = chunk_alert_text(body, short_url)
+                    chunks = await self._format_alert_full(alert)
                     for ci, chunk in enumerate(chunks):
                         await self._send_to_channels(self._alerts_channels, chunk)
                         if ci < len(chunks) - 1:
@@ -885,18 +1028,34 @@ class WeatherService(BaseServicePlugin):
         """Fetch the precip nowcast for the bot's position and push if rain is incoming."""
         try:
             loop = asyncio.get_event_loop()
+            # Prefer the NWS gridpoint (forecaster QPF+PoP — it captures the
+            # convection the Open-Meteo model smooths away); fall back to
+            # Open-Meteo when NWS has no coverage (non-US) or the fetch fails.
             series = await loop.run_in_executor(
                 None,
-                lambda: fetch_precip_series(
+                lambda: fetch_precip_series_nws(
                     self.api_session,
                     self.my_position_lat,
                     self.my_position_lon,
-                    weather_model=self.weather_model or "",
                     timeout=10,
                     logger=self.logger,
                     cache_ttl=self.rain_nowcast_cache_seconds,
+                    pop_floor=self.rain_nowcast_min_probability,
                 ),
             )
+            if not series:
+                series = await loop.run_in_executor(
+                    None,
+                    lambda: fetch_precip_series(
+                        self.api_session,
+                        self.my_position_lat,
+                        self.my_position_lon,
+                        weather_model=self.weather_model or "",
+                        timeout=10,
+                        logger=self.logger,
+                        cache_ttl=self.rain_nowcast_cache_seconds,
+                    ),
+                )
             if not series:
                 return
 
@@ -1346,6 +1505,7 @@ class WeatherService(BaseServicePlugin):
 
             # Extract CAP metadata
             event = ""
+            cap_event = ""
             severity = "Unknown"
             urgency = "Unknown"
             certainty = "Unknown"
@@ -1458,10 +1618,12 @@ class WeatherService(BaseServicePlugin):
                     tag_name = child.tagName
                     tag_lower = tag_name.lower()
 
-                    if ('event' in tag_lower or tag_name.endswith(':event')) and not event:
+                    if tag_lower.endswith(':event'):  # canonical cap:event, NOT cap:eventCode
                         event_val = get_node_value(child)
                         if event_val:
-                            event = event_val
+                            cap_event = event_val  # authoritative full name e.g. "Flood Watch"
+                            if not event:
+                                event = event_val
                     elif 'severity' in tag_lower or tag_name.endswith(':severity'):
                         severity_val = get_node_value(child)
                         if severity_val:
@@ -1514,6 +1676,7 @@ class WeatherService(BaseServicePlugin):
                 'summary': summary,
                 'nws_headline': nws_headline,
                 'event': event,
+                'cap_event': cap_event,
                 'event_type': event_type,
                 'severity': severity,
                 'urgency': urgency,
@@ -1530,61 +1693,73 @@ class WeatherService(BaseServicePlugin):
             return None
 
     async def _send_to_channels(self, channels: list[str], text: str) -> None:
-        """LOCAL MOD (not upstream): post `text` to each channel in the list.
+        """LOCAL MOD (not upstream): enqueue `text` for each channel onto the
+        serialized proactive-send queue.
 
-        Paced 6 s apart to stay above the bot/per-channel rate limits (which drop
-        rather than queue). Used for daily forecast, alerts, and rain pushes.
+        Every proactive push (daily forecast, alerts, rain) goes through this one
+        queue, drained one message every `proactive_send_gap` seconds, so the rain
+        push and the alert push (each on both channels, sometimes multi-message)
+        can't fire on top of each other and collide in the mesh flood.
         """
-        for i, ch in enumerate(channels):
+        if self._send_queue is None:  # service not started yet — send inline
+            for ch in channels:
+                try:
+                    await self.bot.command_manager.send_channel_message(
+                        ch, text, scope=self.get_mesh_flood_scope())
+                except Exception as e:
+                    self.logger.error(f"Error sending weather message to {ch}: {e}")
+            return
+        for ch in channels:
+            await self._send_queue.put((ch, text))
+
+    async def _send_drain_loop(self) -> None:
+        """Single consumer for the proactive-send queue: send one message, then wait
+        `proactive_send_gap` seconds so the mesh flood finishes before the next."""
+        # One-time startup warmup so the first proactive send doesn't go out while
+        # the radio is still booting / draining its RX backlog (it'd report "sent"
+        # but never propagate — the missed first-send-after-restart symptom).
+        try:
+            await asyncio.sleep(self._proactive_send_warmup)
+        except asyncio.CancelledError:
+            return
+        while self._running:
+            try:
+                channel, text = await self._send_queue.get()
+            except asyncio.CancelledError:
+                break
             try:
                 await self.bot.command_manager.send_channel_message(
-                    ch, text, scope=self.get_mesh_flood_scope(),
-                )
+                    channel, text, scope=self.get_mesh_flood_scope())
             except Exception as e:
-                self.logger.error(f"Error sending weather message to {ch}: {e}")
-            if i < len(channels) - 1:
-                await asyncio.sleep(6.0)
+                self.logger.error(f"Error sending queued weather message to {channel}: {e}")
+            finally:
+                self._send_queue.task_done()
+            try:
+                await asyncio.sleep(self._proactive_send_gap)
+            except asyncio.CancelledError:
+                break
 
-    async def _format_alert_full(self, alert: dict[str, Any]) -> tuple[str, str]:
-        """LOCAL MOD (not upstream): full, non-abbreviated alert text + shortened URL.
+    async def _format_alert_full(self, alert: dict[str, Any]) -> list[str]:
+        """LOCAL MOD (not upstream): the proactive alert push, redesigned.
 
-        Returns (body, short_url); the caller chunks the body and appends the URL
-        URL-safely. Keeps the severity emoji and the real NWS event name + details
-        (no compact abbreviation).
+        Returns a list of ready-to-send chunks (<= ALERT_CHUNK_BYTES each), rendered
+        via the shared wx_format helpers so the look matches wx/gwx: a 2-line core
+        (severity dot + canonical cap:event + area / until + office) plus an optional
+        non-boilerplate headline. The shortened link is appended WHOLE — its own
+        final message if it doesn't fit — never split or truncated.
         """
-        severity = alert.get('severity', 'Unknown')
-        emoji = {'Extreme': '🔴', 'Severe': '🟠', 'Moderate': '🟡',
-                 'Minor': '⚪', 'Unknown': '⚪'}.get(severity, '⚪')
-        event = (alert.get('event') or alert.get('event_type') or 'Weather Alert').strip()
-        parts = [f"{emoji} {event}"]
+        from ..wx_format import alert_lines, pack_alert
 
-        # Location: first area in full, "+N more" if several (not abbreviated).
-        area = (alert.get('area_desc') or '').strip()
-        if area:
-            locs = [loc.strip() for loc in area.split(';') if loc.strip()]
-            if locs:
-                loc_str = locs[0] + (f" +{len(locs) - 1} more" if len(locs) > 1 else "")
-                parts.append(f"for {loc_str}")
-
-        expires = alert.get('expires', '')
-        if expires:
-            exp = self._compact_time(expires).strip()
-            if exp:
-                parts.append(f"until {exp}")
-
-        text = ' '.join(parts)
-
-        # Details: NWS headline, else summary — capped so a huge bulletin doesn't
-        # explode into a dozen chunks.
-        details = (alert.get('nws_headline') or alert.get('summary') or '').strip()
-        if details:
-            if len(details) > 300:
-                details = details[:297].rstrip() + '...'
-            text += f". {details}"
-
+        # Canonical full event name from the feed's cap:event ("Flood Watch",
+        # "Severe Thunderstorm Warning"); fall back to title-parsed fields.
+        event = (alert.get('cap_event') or alert.get('event')
+                 or alert.get('event_type') or 'Weather Alert').strip()
+        expires = self._compact_time(alert.get('expires', '') or '').strip()
         office = (alert.get('office') or '').strip()
-        if office:
-            text += f". {office}"
+        # Only the clean NWS headline — NOT the raw `summary` (the full product text
+        # with VTEC/"SVROHX" headers + newlines, which chunks into garbage on mesh).
+        # Collapse any stray whitespace/newlines to a single line.
+        headline = " ".join((alert.get('nws_headline') or '').split())
 
         short_url = ''
         link_url = alert.get('link', '')
@@ -1594,7 +1769,12 @@ class WeatherService(BaseServicePlugin):
             except Exception:
                 short_url = ''
 
-        return text, short_url
+        lines = alert_lines(
+            alert.get('severity', 'Unknown'), event,
+            alert.get('area_desc', ''), expires, office, headline,
+            home=self._alert_county, neighbors=self._get_alert_neighbors(),
+        )
+        return pack_alert(lines, short_url, budget=ALERT_CHUNK_BYTES)
 
     async def _format_alert_compact(self, alert: dict[str, Any], include_details: bool = True) -> str:
         """Format a single alert compactly (same as wx_command).

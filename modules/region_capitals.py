@@ -128,9 +128,13 @@ WORLD_CAPITALS = {
 }
 
 
-def region_capital_query(location: Optional[str]) -> Optional[str]:
-    """Return a ``"Capital, Region"`` geocoder query for a bare country or US
-    state, else ``None``.
+def region_capital_lookup(location: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a bare region to ``("Capital, Region", kind)``, else ``(None, None)``.
+
+    ``kind`` is ``"state"`` for a US state or ``"country"`` for a sovereign
+    country. This lets a US-only caller (the NOAA ``wx`` command) redirect a
+    foreign region to the global command instead of serving a capital NOAA can't
+    reach, while global callers (``gwx``, ``rain``) treat both kinds the same.
 
     Case-insensitive and whitespace-normalized. A comma in the input means the
     user already qualified a city ("Paris, France"), so it's not a bare region.
@@ -138,14 +142,25 @@ def region_capital_query(location: Optional[str]) -> Optional[str]:
     resolving to the city.
     """
     if not location:
-        return None
+        return None, None
     key = " ".join(location.strip().lower().split())
     if not key or "," in location:
-        return None
+        return None, None
     if key in US_STATE_CAPITALS and key not in STATE_AS_CITY:
         capital, abbr = US_STATE_CAPITALS[key]
-        return f"{capital}, {abbr}"
+        return f"{capital}, {abbr}", "state"
     if key in WORLD_CAPITALS:
         capital, country = WORLD_CAPITALS[key]
-        return f"{capital}, {country}"
-    return None
+        return f"{capital}, {country}", "country"
+    return None, None
+
+
+def region_capital_query(location: Optional[str]) -> Optional[str]:
+    """Return a ``"Capital, Region"`` geocoder query for a bare country or US
+    state, else ``None``.
+
+    Thin wrapper over :func:`region_capital_lookup` for callers that don't need
+    to distinguish a US state from a country.
+    """
+    query, _ = region_capital_lookup(location)
+    return query
