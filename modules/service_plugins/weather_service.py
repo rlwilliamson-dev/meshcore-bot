@@ -43,6 +43,7 @@ from ..commands.rain_command import (
     precip_descriptor,
 )
 from ..location_format import reverse_geocode_region
+from ..models import CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD, MeshMessage
 from ..url_shortener import shorten_url_sync
 from ..utils import get_config_timezone
 from .base_service import BaseServicePlugin
@@ -749,7 +750,7 @@ class WeatherService(BaseServicePlugin):
             forecast = _assemble(with_precip=True)
             # Safety: never exceed the channel body budget. Drop the precip tails
             # (least-critical info) before a pathological dual-storm day overflows.
-            if len(forecast.encode("utf-8")) > ALERT_CHUNK_BYTES:
+            if len(forecast.encode("utf-8")) > self._channel_body_budget():
                 forecast = _assemble(with_precip=False)
             return forecast
 
@@ -1826,6 +1827,27 @@ class WeatherService(BaseServicePlugin):
             except asyncio.CancelledError:
                 break
 
+    def _channel_body_budget(self) -> int:
+        """Usable channel body budget in bytes for this service's proactive posts.
+
+        A regional (non-global) flood scope puts extra scope bytes on the wire, so
+        the usable body shrinks by CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD.
+        Proactive sends take their scope from this plugin's flood_scope, a
+        per-channel [Channels] flood_scope.<channel>, or
+        [Channels] outgoing_flood_scope_override, so budget for the regional case
+        when any of those names a regional scope.
+        """
+        scopes = [self.get_mesh_flood_scope()]
+        config = getattr(self.bot, "config", None)
+        if config is not None and config.has_section("Channels"):
+            for key, value in config.items("Channels"):
+                if key == "outgoing_flood_scope_override" or key.startswith("flood_scope."):
+                    scopes.append(value)
+        for scope in scopes:
+            if scope and not MeshMessage.is_global_flood_scope(scope):
+                return ALERT_CHUNK_BYTES - CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
+        return ALERT_CHUNK_BYTES
+
     async def _format_alert_full(self, alert: dict[str, Any]) -> list[str]:
         """LOCAL MOD (not upstream): the proactive alert push, redesigned.
 
@@ -1861,7 +1883,7 @@ class WeatherService(BaseServicePlugin):
             alert.get('area_desc', ''), expires, office, headline,
             home=self._alert_county, neighbors=self._get_alert_neighbors(),
         )
-        return pack_alert(lines, short_url, budget=ALERT_CHUNK_BYTES)
+        return pack_alert(lines, short_url, budget=self._channel_body_budget())
 
     async def _format_alert_compact(self, alert: dict[str, Any], include_details: bool = True) -> str:
         """Format a single alert compactly (same as wx_command).

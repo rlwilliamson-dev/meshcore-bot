@@ -1,10 +1,36 @@
 #!/usr/bin/env python3
 """LOCAL-ONLY tests (not upstream) for the BNA-WX-BOT customizations.
 
-Covers the URL-safe alert chunker. See /Users/ryan/wx-bot-local-mods.md.
+Covers the URL-safe alert chunker and the scope-aware send budget.
+See /Users/ryan/wx-bot-local-mods.md.
 """
 
-from modules.service_plugins.weather_service import ALERT_CHUNK_BYTES, chunk_alert_text
+import configparser
+from unittest.mock import Mock
+
+from modules.models import CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
+from modules.service_plugins.weather_service import (
+    ALERT_CHUNK_BYTES,
+    WeatherService,
+    chunk_alert_text,
+)
+
+
+def _service(scope=None):
+    """WeatherService with just enough config to resolve the outgoing send budget."""
+    config = configparser.ConfigParser()
+    config.add_section("Weather")
+    config.add_section("Weather_Service")
+    config.set("Weather_Service", "my_position_lat", "36.16")
+    config.set("Weather_Service", "my_position_lon", "-86.78")
+    config.add_section("Channels")
+    if scope is not None:
+        config.set("Channels", "outgoing_flood_scope_override", scope)
+    bot = Mock()
+    bot.logger = Mock()
+    bot.config = config
+    bot.db_manager = Mock()
+    return WeatherService(bot)
 
 
 def test_short_alert_one_message_url_intact():
@@ -52,3 +78,21 @@ def test_words_never_split():
     rejoined = " ".join(m.removeprefix("...") for m in out)
     for i in range(60):
         assert f"word{i}" in rejoined.split()
+
+
+# --- scope-aware send budget -------------------------------------------------
+# A regional flood scope puts extra scope bytes on the wire, so alerts and the
+# daily push have to pack into a smaller body or the mesh truncates them.
+
+def test_budget_is_full_on_global_flood():
+    assert _service()._channel_body_budget() == ALERT_CHUNK_BYTES
+
+
+def test_budget_drops_for_regional_scope():
+    budget = _service("#us-tn-middle")._channel_body_budget()
+    assert budget == ALERT_CHUNK_BYTES - CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
+
+
+def test_budget_full_for_explicit_global_markers():
+    for marker in ("*", "0", "None", ""):
+        assert _service(marker)._channel_body_budget() == ALERT_CHUNK_BYTES, marker
