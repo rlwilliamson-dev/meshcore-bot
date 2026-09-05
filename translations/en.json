@@ -220,7 +220,7 @@
       "error_fetching": "Error fetching weather data from NOAA",
       "no_location_zipcode": "Could not find location for zipcode {location}",
       "no_location_city": "Could not find city '{location}' in {state}",
-      "redirect_gwx": "🌍 {location} is outside NOAA's US coverage — try: gwx {location}",
+      "redirect_gwx": "🌍 {location} is outside NOAA's US coverage, try: gwx {location}",
       "error": "Error getting weather data: {error}",
       "alerts": "{count} alerts: {text}",
       "tomorrow_not_available": "Tomorrow's forecast not available",
@@ -231,7 +231,8 @@
       "mqtt_weather_no_subscriber": "MQTT weather subscriber is not active (enable [MqttWeather] and custom.mqtt_weather.* topics)",
       "mqtt_weather_no_data": "No MQTT weather message received for this topic yet",
       "mqtt_weather_stale": "MQTT weather data is too old",
-      "mqtt_weather_payload_error": "MQTT weather payload error: {detail}"
+      "mqtt_weather_payload_error": "MQTT weather payload error: {detail}",
+      "unknown_option": "❓ unknown option '{option}'. Try: tomorrow, 7d, or hourly"
     },
     "gwx": {
       "description": "Worldwide weather (Open-Meteo): city, country, or lat,lon. Add tomorrow | Nd | hourly. e.g. gwx tokyo",

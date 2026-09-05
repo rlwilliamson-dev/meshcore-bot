@@ -169,7 +169,7 @@ def test_wx_bare_state_resolves_to_capital_with_note():
 def test_wx_bare_foreign_country_redirects_to_gwx_without_geocoding():
     cmd, captured = _build_wx()
     resp = _run_wx(cmd, captured, "wx france")
-    assert resp == "🌍 france is outside NOAA's US coverage — try: gwx france"
+    assert resp == "🌍 france is outside NOAA's US coverage, try: gwx france"
     cmd.city_to_lat_lon.assert_not_called()  # short-circuits before any geocode
     cmd.get_noaa_weather.assert_not_called()
 
@@ -177,7 +177,7 @@ def test_wx_bare_foreign_country_redirects_to_gwx_without_geocoding():
 def test_wx_foreign_city_redirects_to_gwx():
     cmd, captured = _build_wx()
     resp = _run_wx(cmd, captured, "wx tokyo")
-    assert resp == "🌍 tokyo is outside NOAA's US coverage — try: gwx tokyo"
+    assert resp == "🌍 tokyo is outside NOAA's US coverage, try: gwx tokyo"
     cmd.get_noaa_weather.assert_not_called()  # never reaches NOAA
 
 
@@ -185,7 +185,7 @@ def test_wx_qualified_foreign_city_redirects_and_is_not_treated_as_region():
     cmd, captured = _build_wx()
     resp = _run_wx(cmd, captured, "wx paris, france")
     # The comma means it's a city, so it geocodes (to FR) then redirects.
-    assert resp == "🌍 paris, france is outside NOAA's US coverage — try: gwx paris, france"
+    assert resp == "🌍 paris, france is outside NOAA's US coverage, try: gwx paris, france"
 
 
 def test_wx_normal_us_city_unchanged_no_note():
@@ -340,3 +340,25 @@ def test_zip_to_city_string_prefers_usps_city_over_county():
     fake.json = lambda: {"places": [{"place name": "Middlesboro", "state abbreviation": "KY"}]}
     with patch("requests.get", return_value=fake):
         assert lf.zip_to_city_string("40965") == "Middlesboro, KY"
+
+
+# --- wx: a ZIP is a complete location, trailing junk is a bad option ---------
+
+def test_wx_zip_with_mistyped_option_reports_unknown_option():
+    """Regression: "wx 37138 houry" (mistyped "hourly") geocoded the whole string
+    as a city name, fuzzy-matched somewhere outside the US, and told the user the
+    ZIP was outside NOAA's coverage. Report the bad option instead.
+    """
+    cmd, captured = _build_wx()
+    resp = _run_wx(cmd, captured, "wx 37138 houry")
+    assert "houry" in resp
+    assert "outside NOAA" not in resp
+    cmd.city_to_lat_lon.assert_not_called()
+
+
+def test_wx_multiword_city_is_not_mistaken_for_a_bad_option():
+    """The guard keys off a leading 5-digit ZIP, so ordinary multi-word locations
+    (and "city, state") still geocode normally."""
+    cmd, captured = _build_wx()
+    _run_wx(cmd, captured, "wx nashville, tn")
+    cmd.city_to_lat_lon.assert_called()

@@ -729,6 +729,17 @@ class WxCommand(BaseCommand):
                 await self.send_response(message, self.translate('commands.wx.usage'))
                 return True
 
+        # A US ZIP is a complete location, so a leftover token after one was meant
+        # to be an option (e.g. a mistyped "hourly"). Say so, rather than geocoding
+        # "37138 houry" as a place name and reporting it outside NOAA's coverage.
+        zip_parts = location.split()
+        if len(zip_parts) > 1 and re.fullmatch(r"\d{5}", zip_parts[0]):
+            await self.send_response(
+                message,
+                self.translate('commands.wx.unknown_option', option=' '.join(zip_parts[1:])),
+            )
+            return True
+
         # "wx help" / "wx ?" -> show usage, don't geocode "help" as a place.
         if location.lower() in ("help", "?", "-h", "--help"):
             await self.send_response(message, self.translate('commands.wx.usage'))
