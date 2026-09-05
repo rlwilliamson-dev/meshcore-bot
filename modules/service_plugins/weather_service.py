@@ -1788,12 +1788,18 @@ class WeatherService(BaseServicePlugin):
         queue, drained one message every `proactive_send_gap` seconds, so the rain
         push and the alert push (each on both channels, sometimes multi-message)
         can't fire on top of each other and collide in the mesh flood.
+
+        Sends pass `skip_user_rate_limit=True`. Nobody asked for these, so they must
+        not spend the budget that answers commands: a push landing a second before
+        a user's `wx` was silently swallowing the reply. Per-channel limits, the TX
+        rate limiter and tx_delay still apply.
         """
         if self._send_queue is None:  # service not started yet — send inline
             for ch in channels:
                 try:
                     await self.bot.command_manager.send_channel_message(
-                        ch, text, scope=self.get_mesh_flood_scope())
+                        ch, text, scope=self.get_mesh_flood_scope(),
+                        skip_user_rate_limit=True)
                 except Exception as e:
                     self.logger.error(f"Error sending weather message to {ch}: {e}")
             return
@@ -1817,7 +1823,8 @@ class WeatherService(BaseServicePlugin):
                 break
             try:
                 await self.bot.command_manager.send_channel_message(
-                    channel, text, scope=self.get_mesh_flood_scope())
+                    channel, text, scope=self.get_mesh_flood_scope(),
+                    skip_user_rate_limit=True)
             except Exception as e:
                 self.logger.error(f"Error sending queued weather message to {channel}: {e}")
             finally:

@@ -96,3 +96,52 @@ def test_budget_drops_for_regional_scope():
 def test_budget_full_for_explicit_global_markers():
     for marker in ("*", "0", "None", ""):
         assert _service(marker)._channel_body_budget() == ALERT_CHUNK_BYTES, marker
+
+
+# --- proactive pushes must not spend the command reply budget ----------------
+#
+# The alert push and a user's command share the global rate_limit_seconds
+# budget. A push landing a second before someone's "wx" left the reply
+# rate-limited and silently dropped (observed 2026-09-05 11:47:08).
+
+def _capture_sends(service):
+    sent = []
+
+    async def _send(channel, text, **kwargs):
+        sent.append((channel, kwargs))
+        return True
+
+    service.bot.command_manager = Mock()
+    service.bot.command_manager.send_channel_message = _send
+    return sent
+
+
+def test_inline_proactive_send_skips_user_rate_limit():
+    import asyncio
+    service = _service()
+    sent = _capture_sends(service)
+    service._send_queue = None  # not started yet -> inline path
+    asyncio.run(service._send_to_channels(["#bna-wx", "#tn-middle"], "alert body"))
+    assert [ch for ch, _ in sent] == ["#bna-wx", "#tn-middle"]
+    for channel, kwargs in sent:
+        assert kwargs.get("skip_user_rate_limit") is True, channel
+
+
+def test_queued_proactive_send_skips_user_rate_limit():
+    import asyncio
+    service = _service()
+    sent = _capture_sends(service)
+
+    async def _drain_once():
+        service._send_queue = asyncio.Queue()
+        service._running = True
+        service._proactive_send_warmup = 0
+        service._proactive_send_gap = 0
+        await service._send_queue.put(("#bna-wx", "alert body"))
+        task = asyncio.create_task(service._send_drain_loop())
+        await service._send_queue.join()
+        task.cancel()
+
+    asyncio.run(_drain_once())
+    assert sent and sent[0][0] == "#bna-wx"
+    assert sent[0][1].get("skip_user_rate_limit") is True
