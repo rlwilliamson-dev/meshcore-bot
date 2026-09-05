@@ -55,7 +55,7 @@ def make_series(
     }
 
 
-def make_bot(*, bot_name="BNA-WX-BOT-V3", rain_overrides=None):
+def make_bot(*, bot_name="WeatherBot-V3", rain_overrides=None):
     """A minimal bot with a real config + real translator and a capturing
     command_manager.send_response. Returns (bot, captured_responses_list).
 
@@ -99,7 +99,7 @@ def make_bot(*, bot_name="BNA-WX-BOT-V3", rain_overrides=None):
 
 def build_cmd(
     series=None, *, coords=DEFAULT_COORDS, label=DEFAULT_LABEL,
-    rain_overrides=None, bot_name="BNA-WX-BOT-V3",
+    rain_overrides=None, bot_name="WeatherBot-V3",
 ):
     """RainCommand wired to a fixed resolved location. When `series` is given,
     the Open-Meteo fetch is stubbed to it; when None, the real fetch runs

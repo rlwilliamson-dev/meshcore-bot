@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from modules.core import MeshCoreBot
+from modules.i18n import Translator
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -147,6 +148,119 @@ monitor_channels = #general
         config_file.unlink()
         success, msg = b.reload_config()
         assert success is False
+
+    def test_reload_drops_keys_deleted_from_file(self, tmp_path):
+        """ConfigParser.read() merges; reload must not resurrect deleted keys.
+
+        The web settings UI deletes rows (e.g. announce.* triggers) from
+        config.ini — a reload afterwards has to reflect the deletion.
+        """
+        config_file = tmp_path / "config.ini"
+        db_path = tmp_path / "bot.db"
+        _write_config(config_file, db_path, extra="[Channels_List]\nseattle = Seattle chat\n")
+        b = MeshCoreBot(config_file=str(config_file))
+        assert b.config.get("Channels_List", "seattle") == "Seattle chat"
+        # Remove the key (and its whole section) from the file.
+        _write_config(config_file, db_path)
+        success, _ = b.reload_config()
+        assert success is True
+        assert not b.config.has_section("Channels_List") or not b.config.has_option(
+            "Channels_List", "seattle"
+        )
+
+    def test_reload_reinstantiates_command_plugins(self, tmp_path):
+        """Command settings are cached in __init__; reload must refresh them."""
+        config_file = tmp_path / "config.ini"
+        db_path = tmp_path / "bot.db"
+        _write_config(config_file, db_path, extra="[Ping_Command]\nenabled = true\n")
+        b = MeshCoreBot(config_file=str(config_file))
+        if not hasattr(b, "command_manager"):
+            pytest.skip("bot built without command_manager")
+        before = b.command_manager.commands.get("ping")
+        _write_config(config_file, db_path, extra="[Ping_Command]\nenabled = false\n")
+        success, _ = b.reload_config()
+        assert success is True
+        after = b.command_manager.commands.get("ping")
+        assert after is not None and after is not before
+        assert b.config.getboolean("Ping_Command", "enabled") is False
+
+    def test_reload_replaces_translator_cache_atomically(self, tmp_path):
+        config_file = tmp_path / "config.ini"
+        db_path = tmp_path / "bot.db"
+        _write_config(
+            config_file,
+            db_path,
+            extra="[Localization]\nlanguage = en\ntranslation_path = translations/\n",
+        )
+        b = MeshCoreBot(config_file=str(config_file))
+        old_cache = b._translator_cache
+
+        _write_config(
+            config_file,
+            db_path,
+            extra="[Localization]\nlanguage = de\ntranslation_path = translations/\n",
+        )
+        success, _ = b.reload_config()
+
+        assert success is True
+        assert b.translation_path == "translations/"
+        assert b.translator.language == "de"
+        assert b._translator_cache == {"de": b.translator}
+        assert b._translator_cache is not old_cache
+
+    def test_failed_reload_restores_translator_cache(self, tmp_path):
+        config_file = tmp_path / "config.ini"
+        db_path = tmp_path / "bot.db"
+        _write_config(
+            config_file,
+            db_path,
+            extra="[Localization]\nlanguage = en\ntranslation_path = translations/\n",
+        )
+        b = MeshCoreBot(config_file=str(config_file))
+        old_translator = b.translator
+        old_path = b.translation_path
+        old_cache = b._translator_cache
+
+        _write_config(
+            config_file,
+            db_path,
+            extra="[Localization]\nlanguage = de\ntranslation_path = translations/\n",
+        )
+        with patch("modules.core.CommandManager", side_effect=RuntimeError("boom")):
+            success, _ = b.reload_config()
+
+        assert success is False
+        assert b.translator is old_translator
+        assert b.translation_path == old_path
+        assert b._translator_cache is old_cache
+
+
+class TestResponseTranslators:
+    def test_locale_only_catalog_is_available_by_base_language(
+        self, tmp_path, monkeypatch
+    ):
+        translations = tmp_path / "translations"
+        translations.mkdir()
+        (translations / "en.json").write_text(
+            '{"commands": {"hello": {"response_format": "Hello"}}}',
+            encoding="utf-8",
+        )
+        (translations / "fr-CA.json").write_text(
+            '{"commands": {"hello": {"response_format": "Allo"}}}',
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        b = object.__new__(MeshCoreBot)
+        b.logger = MagicMock()
+        b.translation_path = str(translations)
+        b.translator = Translator("en", b.translation_path)
+        b._translator_cache = {"en": b.translator}
+
+        assert b.available_languages() == {"en", "fr"}
+        french = b.get_translator("fr")
+        assert french.language == "fr-CA"
+        assert french.translate("commands.hello.response_format") == "Allo"
 
 
 # ---------------------------------------------------------------------------

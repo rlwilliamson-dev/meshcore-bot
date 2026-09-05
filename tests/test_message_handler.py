@@ -1969,6 +1969,8 @@ def new_contact_env(mock_logger):
     rm.manage_contact_list = AsyncMock(return_value={"success": True})
     rm.add_companion_from_contact_data = AsyncMock(return_value=True)
     rm.log_purging_action = Mock()
+    rm.get_tracked_contact_row = Mock(return_value=None)
+    rm.is_contact_on_device = Mock(return_value=False)
     rm.db_manager = Mock()
     rm.db_manager.execute_update = Mock()
     rm._is_repeater_device = Mock(return_value=False)
@@ -2042,3 +2044,68 @@ class TestHandleNewContactAutoManage:
         await handler.handle_new_contact(ev, None)
         assert rm.track_contact_advertisement.await_count == 2
         rm.add_companion_from_contact_data.assert_awaited_once()
+
+    async def test_new_companion_logs_new_and_records_audit(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "false")
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        log_messages = [str(call.args[0]) for call in bot.logger.info.call_args_list if call.args]
+        assert any("New companion discovered" in msg for msg in log_messages)
+        assert not any("Known companion advert" in msg for msg in log_messages)
+        rm.log_purging_action.assert_called_once()
+
+    async def test_known_companion_logs_known_and_skips_audit(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "false")
+        rm.get_tracked_contact_row.return_value = {
+            "public_key": _companion_contact_payload()["public_key"],
+            "name": "Alice",
+            "role": "companion",
+        }
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        log_messages = [str(call.args[0]) for call in bot.logger.info.call_args_list if call.args]
+        assert any("Known companion advert" in msg for msg in log_messages)
+        assert not any("New companion discovered" in msg for msg in log_messages)
+        rm.log_purging_action.assert_not_called()
+
+    async def test_known_companion_via_device_contact_skips_audit(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "false")
+        # No tracking-DB row, but the radio already has the contact on-device.
+        rm.is_contact_on_device.return_value = True
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        log_messages = [str(call.args[0]) for call in bot.logger.info.call_args_list if call.args]
+        assert any("Known companion advert" in msg for msg in log_messages)
+        rm.log_purging_action.assert_not_called()
+
+    async def test_known_repeater_logs_known_not_new(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "false")
+        rm._is_repeater_device.return_value = True
+        rm.get_tracked_contact_row.return_value = {
+            "public_key": _companion_contact_payload()["public_key"],
+            "name": "Roof",
+            "role": "repeater",
+        }
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        log_messages = [str(call.args[0]) for call in bot.logger.info.call_args_list if call.args]
+        assert any("Known repeater advert" in msg for msg in log_messages)
+        assert not any("New repeater discovered" in msg for msg in log_messages)
+        # Repeaters are never pushed to the device contact list.
+        mesh.commands.add_contact.assert_not_called()
+        rm.add_companion_from_contact_data.assert_not_called()
+
+    async def test_new_repeater_logs_new_and_stays_off_device(self, new_contact_env):
+        bot, handler, rm, mesh = new_contact_env
+        bot.config.set("Bot", "auto_manage_contacts", "device")
+        rm._is_repeater_device.return_value = True
+        ev = _NewContactEvent(_companion_contact_payload())
+        await handler.handle_new_contact(ev, None)
+        log_messages = [str(call.args[0]) for call in bot.logger.info.call_args_list if call.args]
+        assert any("New repeater discovered" in msg for msg in log_messages)
+        mesh.commands.add_contact.assert_not_called()
+        rm.add_companion_from_contact_data.assert_not_called()

@@ -33,6 +33,12 @@ class TestCommand(BaseCommand):
     usage = "test [phrase]"
     examples = ["test", "t hello world"]
 
+    # Web-viewer settings schema (see modules/settings_schema.py)
+    settings_schema = [
+        {"key": "response_format", "label": "Response format", "type": "str", "default": "",
+         "help": "Template for the test reply. Empty uses the default format."},
+    ]
+
     def __init__(self, bot):
         super().__init__(bot)
         self.test_enabled = self.get_config_value('Test_Command', 'enabled', fallback=True, value_type='bool')
@@ -701,6 +707,7 @@ class TestCommand(BaseCommand):
                 'timestamp': timestamp,
                 'elapsed': elapsed,
                 'snr': str(message.snr) if message.snr is not None else self.translate('common.unknown'),
+                'rssi': str(message.rssi) if message.rssi is not None else self.translate('common.unknown'),
                 'path_distance': path_distance or '',
                 'firstlast_distance': firstlast_distance or '',
             }

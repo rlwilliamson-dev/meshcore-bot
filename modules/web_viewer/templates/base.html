@@ -10,7 +10,7 @@
     <link rel="manifest" href="{{ url_for('static', filename='ico/site.webmanifest') }}">
 
     <!-- Apply theme immediately to prevent flash -->
-    <script>
+    <script nonce="{{ g.csp_nonce }}">
         (function () {
             const storedTheme = localStorage.getItem('theme');
             const systemPreference = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
@@ -242,6 +242,14 @@
             color: var(--text-color);
         }
 
+        [data-theme="dark"] .form-control:disabled,
+        [data-theme="dark"] .form-control[readonly],
+        [data-theme="dark"] .form-select:disabled {
+            background-color: var(--bg-color);
+            border-color: var(--border-color);
+            color: var(--text-muted);
+        }
+
         /* Dark mode text muted */
         [data-theme="dark"] .text-muted {
             color: var(--text-muted) !important;
@@ -450,6 +458,11 @@
                         </a>
                     </li>
                     <li class="nav-item">
+                        <a class="nav-link" href="/plugins">
+                            <i class="fas fa-puzzle-piece"></i> Plugins
+                        </a>
+                    </li>
+                    <li class="nav-item">
                         <a class="nav-link" href="/logs">
                             <i class="fas fa-file-alt"></i> Logs
                         </a>
@@ -505,7 +518,7 @@
                 </div>
                 <div class="d-flex gap-2 align-items-center flex-shrink-0">
                     <span class="small opacity-75">After power cycling:</span>
-                    <button id="zombie-recover-btn" class="btn btn-warning btn-sm fw-semibold" onclick="zombieRecover()"
+                    <button id="zombie-recover-btn" class="btn btn-warning btn-sm fw-semibold"
                         type="button">
                         <i class="fas fa-power-off me-1"></i>Restart Bot Processing
                     </button>
@@ -532,7 +545,7 @@
                 </div>
                 <div class="d-flex gap-2 align-items-center flex-shrink-0">
                     <span class="small opacity-75">Once radio is fixed:</span>
-                    <button id="offline-clear-btn" class="btn btn-dark btn-sm fw-semibold" onclick="radioOfflineClear()"
+                    <button id="offline-clear-btn" class="btn btn-dark btn-sm fw-semibold"
                         type="button">
                         <i class="fas fa-check me-1"></i>Clear Offline Flag
                     </button>
@@ -541,7 +554,7 @@
         </div>
     </div>
 
-    <script>
+    <script nonce="{{ g.csp_nonce }}">
         // Global 401 interceptor: redirect to login when session expires mid-page.
         // Wraps window.fetch so all AJAX calls in every template are covered.
         (function () {
@@ -609,6 +622,9 @@
                 });
         }
 
+        document.getElementById('zombie-recover-btn')?.addEventListener('click', zombieRecover);
+        document.getElementById('offline-clear-btn')?.addEventListener('click', radioOfflineClear);
+
         // Live banner polling — updates all banners every 10s without a page reload
         (function () {
             function applyBannerStatus(d) {
@@ -655,15 +671,12 @@
     <footer class="text-center py-2" style="font-size: 0.7rem;">
         <a href="https://github.com/agessaman/meshcore-bot" target="_blank" rel="noopener noreferrer"
             style="color: var(--text-muted, #6c757d); text-decoration: none;">meshcore-bot</a>
-        {% if version_info.tag %}
-        <span class="mx-1" style="color: var(--text-muted, #6c757d);"> {{ version_info.tag }}</span>
-        {% elif version_info.branch or version_info.commit or version_info.date %}
+        {# 'display' already folds in branch/tag/commit — same string !version
+           prints. Only the date is added, since display never carries it. #}
+        {% if version_info.display %}
         <span class="mx-1" style="color: var(--text-muted, #6c757d);">
-            {% if version_info.branch %}{{ version_info.branch }}{% endif %}
-            {% if version_info.commit %}{% if version_info.branch %} · {% endif %}<code class="text-muted"
-                style="font-size: inherit;">{{ version_info.commit }}</code>{% endif %}
-            {% if version_info.date %}{% if version_info.branch or version_info.commit %} · {% endif %}{{
-            version_info.date }}{% endif %}
+            {{ version_info.display }}
+            {% if version_info.date %} · {{ version_info.date }}{% endif %}
         </span>
         {% endif %}
         <span class="mx-1" style="color: var(--text-muted, #6c757d);"> for </span>
@@ -687,7 +700,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/js-sha256/0.11.0/sha256.min.js"></script>
 
     <!-- Base JavaScript -->
-    <script>
+    <script nonce="{{ g.csp_nonce }}">
         // Global connection management
         class ModernConnectionManager {
             constructor() {
@@ -714,21 +727,18 @@
 
             setupSocketEvents() {
                 this.socket.on('connect', () => {
-                    console.log('Connected to server');
                     this.connected = true;
                     this.updateConnectionStatus('Connected', 'connected');
                     this.lastActivity = new Date();
                     this.updateLastActivity();
                 });
 
-                this.socket.on('disconnect', (reason) => {
-                    console.log('Disconnected from server:', reason);
+                this.socket.on('disconnect', () => {
                     this.connected = false;
                     this.updateConnectionStatus('Disconnected', 'disconnected');
                 });
 
                 this.socket.on('status', (data) => {
-                    console.log('Server status:', data.message);
                     this.showNotification(data.message, 'info');
                 });
 
@@ -739,7 +749,6 @@
 
                 // Modern ping/pong pattern
                 this.socket.on('pong', () => {
-                    console.log('Pong received from server');
                     this.lastActivity = new Date();
                     this.updateLastActivity();
                 });
@@ -784,13 +793,20 @@
             showNotification(message, type = 'info') {
                 // Create notification element
                 const notification = document.createElement('div');
-                notification.className = `alert alert-${type} alert-dismissible fade show position-fixed`;
+                const safeType = ['info', 'success', 'warning', 'danger'].includes(type)
+                    ? type
+                    : 'info';
+                notification.className = `alert alert-${safeType} alert-dismissible fade show position-fixed`;
                 notification.style.cssText = 'top: 20px; right: 20px; z-index: 9999; max-width: 300px;';
 
-                notification.innerHTML = `
-                    ${message}
-                    <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
-                `;
+                const notificationText = document.createElement('span');
+                notificationText.textContent = String(message ?? '');
+                const closeButton = document.createElement('button');
+                closeButton.type = 'button';
+                closeButton.className = 'btn-close';
+                closeButton.setAttribute('data-bs-dismiss', 'alert');
+                closeButton.setAttribute('aria-label', 'Close');
+                notification.append(notificationText, closeButton);
 
                 document.body.appendChild(notification);
 

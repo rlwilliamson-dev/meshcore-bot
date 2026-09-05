@@ -6,6 +6,7 @@ Open-Meteo's 15-minutely precipitation forecast. Works worldwide, no API key.
 
 import asyncio
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -15,16 +16,29 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from ..location_format import (
+from ..location import (
+    US_STATE_ABBRS,  # noqa: F401 — re-exported for weather_service/tests
     city_display_name,
     join_location,
     reverse_geocode_region,
-    zip_to_city_string,
+    titlecase_location,  # noqa: F401 — re-exported for weather_service/tests
+)
+from ..location import (
+    zip_to_city_string as location_zip_to_city_string,
 )
 from ..models import MeshMessage
 from ..region_capitals import REGION_DEFAULT_NOTE, region_capital_query
 from ..utils import geocode_city_sync, geocode_zipcode_sync
 from .base_command import BaseCommand
+
+# Re-exports for weather_service / tests that import display helpers from rain_command.
+__all_location_reexports__ = (
+    "US_STATE_ABBRS",
+    "city_display_name",
+    "join_location",
+    "reverse_geocode_region",
+    "titlecase_location",
+)
 
 # WMO weather code -> precipitation "bucket". Buckets map to an emoji and a
 # translatable label (commands.rain.precip_types.<bucket>). Codes not listed
@@ -74,15 +88,20 @@ SNOW_FAMILY = frozenset({"snow"})
 # queried for many distinct locations can't grow them without limit.
 _GEOCODE_CACHE_CAP = 256
 
+_CACHE_PUT_LOCK = threading.Lock()
+
 
 def _cache_put(cache: dict, key: Any, value: Any) -> None:
     """Insert into a size-capped cache, evicting the oldest entry when full.
 
-    Relies on dicts preserving insertion order (Python 3.7+).
+    Relies on dicts preserving insertion order (Python 3.7+). Locked because
+    location resolution runs on worker threads: two concurrent evictions would
+    otherwise raise out of the command and leave the user without a reply.
     """
-    if key not in cache and len(cache) >= _GEOCODE_CACHE_CAP:
-        cache.pop(next(iter(cache)))
-    cache[key] = value
+    with _CACHE_PUT_LOCK:
+        if key not in cache and len(cache) >= _GEOCODE_CACHE_CAP:
+            cache.pop(next(iter(cache)))
+        cache[key] = value
 
 
 def precip_bucket_for_code(code: Optional[int]) -> Optional[str]:
@@ -297,8 +316,24 @@ def fetch_precip_series(
     return series
 
 
+def nws_http_means_no_coverage(status_code: int) -> bool:
+    """True when an NWS HTTP status means the point has no US weather.gov coverage."""
+    return status_code in (400, 404)
+
+
+# --- NWS gridpoint precip source ---------------------------------------------
+# WHY THIS EXISTS: the Open-Meteo *forecast model* (fetch_precip_series, above)
+# smooths away scattered, pop-up convection, so the nowcast can miss rain that is
+# actually happening. Observed near Nashville (36.16, -86.78): Open-Meteo reported
+# 0.00 in / ~12% precip across the next 3 h while NWS's own gridpoint showed
+# 65-74% probability with measurable QPF — and thunderstorms were occurring. The
+# model-based push therefore never fired. NWS's gridpoint forecast is
+# forecaster-adjusted and does capture convective chances, so for US points we
+# prefer it (fetch_precip_series_nws) and fall back to Open-Meteo only where NWS
+# has no coverage (outside the US) or the request fails.
+
 # NWS gridpoint "weather" type -> a representative WMO code, so precip_bucket_for_code()
-# classifies the NWS series exactly like it classifies Open-Meteo (rain/snow/thunder/…).
+# classifies the NWS series exactly like it classifies the Open-Meteo one.
 _NWS_WEATHER_CODE = [
     ("thunderstorm", 95),
     ("snow", 73), ("blowing_snow", 73), ("snow_showers", 73),
@@ -321,8 +356,10 @@ def _iso_duration_hours(dur: str) -> int:
 def _nws_hourly(values: Optional[list], *, divide: bool) -> dict:
     """Map hour-start (naive UTC datetime) -> value from an NWS gridpoint property.
 
-    `divide` splits an accumulation (e.g. 6-hour QPF) evenly across its hours;
-    otherwise the period's value is repeated for each hour (PoP, temperature, weather).
+    NWS reports each property as time-bucketed values whose validTime is an ISO
+    interval like '2026-06-08T12:00:00+00:00/PT6H'. ``divide`` splits an
+    accumulation (e.g. 6-hour QPF) evenly across its hours; otherwise the period's
+    value is repeated for each hour (hourly PoP, the weather-type list).
     """
     out: dict = {}
     for v in values or []:
@@ -339,8 +376,8 @@ def _nws_hourly(values: Optional[list], *, divide: bool) -> dict:
     return out
 
 
-def _nws_weather_code(value) -> Optional[int]:
-    """Pick a representative WMO code from an NWS gridpoint `weather` value (list of segments)."""
+def _nws_weather_code(value: Any) -> Optional[int]:
+    """Pick a representative WMO code from an NWS gridpoint ``weather`` value (list of segments)."""
     if not value:
         return None
     blob = " ".join(
@@ -361,23 +398,26 @@ def fetch_precip_series_nws(
     *,
     timeout: int = 10,
     logger: Any = None,
-    cache_ttl: float = 0.0,
     pop_floor: int = 50,
+    cache_ttl: float = 0.0,
 ) -> Optional[dict]:
     """Build a precip nowcast series from the NWS gridpoint forecast (US only).
 
-    Same return shape as fetch_precip_series. The Open-Meteo *model* smooths away
-    scattered convection (it reported 0.0 in over Nashville while NWS showed 74%
-    PoP), so for US points we prefer NWS's forecaster-adjusted gridpoint: 6-hour
-    QPF (mm) + hourly PoP (%) + hourly temperature + a weather-type series. We
-    build an hourly series where each hour's precip is its QPF share, zeroed when
-    that hour's PoP is below `pop_floor` so the rain-start tracks the hourly
-    probability rather than snapping to 6-hour QPF boundaries. Returns None when
-    NWS has no coverage (e.g. outside the US) so the caller can fall back to
-    Open-Meteo. Times are naive UTC ISO strings (internally consistent; the
-    nowcast works on relative minutes, and the messages are relative too).
+    Returns the same shape as fetch_precip_series (times/precip/codes/now/
+    current_precip/current_code/step), or None when NWS has no coverage (e.g.
+    outside the US) so the caller can fall back to Open-Meteo.
+
+    NWS exposes 6-hour QPF (mm) and hourly PoP (%). We build an hourly series in
+    which each hour's precip is its QPF share, but zeroed when that hour's PoP is
+    below ``pop_floor`` -- so the predicted rain-start tracks the hourly
+    probability rather than snapping to coarse 6-hour QPF boundaries, and a trace
+    of QPF at a low chance is not reported as rain. Times are naive UTC ISO strings
+    (they only need to be self-consistent: the nowcast works on relative minutes).
+
+    When cache_ttl > 0, a fresh prior result for the same rounded location is reused
+    (shared bounded cache with fetch_precip_series).
     """
-    cache_key = (round(lat, 3), round(lon, 3), "_nws")
+    cache_key = (round(lat, 2), round(lon, 2), "nws")
     if cache_ttl > 0:
         hit = _SERIES_CACHE.get(cache_key)
         if hit is not None and (time.time() - hit[0]) < cache_ttl:
@@ -390,14 +430,14 @@ def fetch_precip_series_nws(
             headers=headers, timeout=timeout,
         )
         if not pts.ok:
-            return None  # no NWS coverage (outside US) -> caller falls back to Open-Meteo
+            return None  # no NWS coverage (outside the US) -> caller falls back to Open-Meteo
         grid_url = (pts.json().get("properties") or {}).get("forecastGridData")
         if not grid_url:
             return None
         gp = session.get(grid_url, headers=headers, timeout=timeout)
         if not gp.ok:
             return None
-        props = (gp.json().get("properties") or {})
+        props = gp.json().get("properties") or {}
     except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
         if logger:
             logger.debug(f"NWS nowcast timeout/connection error: {e}")
@@ -407,11 +447,9 @@ def fetch_precip_series_nws(
             logger.debug(f"NWS nowcast parse error: {e}")
         return None
 
-    qpf = _nws_hourly((props.get("quantitativePrecipitation") or {}).get("values"), divide=True)    # mm/hr
-    pop = _nws_hourly((props.get("probabilityOfPrecipitation") or {}).get("values"), divide=False)  # %
-    tmp = _nws_hourly((props.get("temperature") or {}).get("values"), divide=False)                 # °C
-    snowmm = _nws_hourly((props.get("snowfallAmount") or {}).get("values"), divide=True)            # mm/hr
-    wx = _nws_hourly((props.get("weather") or {}).get("values"), divide=False)                      # list seg
+    qpf = _nws_hourly((props.get("quantitativePrecipitation") or {}).get("values"), divide=True)
+    pop = _nws_hourly((props.get("probabilityOfPrecipitation") or {}).get("values"), divide=False)
+    wx = _nws_hourly((props.get("weather") or {}).get("values"), divide=False)
     if not qpf and not pop:
         return None
 
@@ -421,36 +459,31 @@ def fetch_precip_series_nws(
 
     times: list[str] = []
     precip: list[Optional[float]] = []
-    prob: list[Optional[float]] = []
-    temp: list[Optional[float]] = []
-    snow: list[Optional[float]] = []
     codes: list[Optional[int]] = []
     for h in hours:
         p = pop.get(h)
         q = qpf.get(h)
-        # An hour counts as precipitating only when NWS gives a real chance; the
-        # amount is its QPF share. (QPF is 6-hourly, PoP hourly — PoP sets timing.)
+        # Count an hour as precipitating only when NWS gives a real chance; the
+        # amount is its QPF share. (QPF is 6-hourly, PoP hourly -- PoP sets timing.)
         amt = q if (q is not None and p is not None and p >= pop_floor) else 0.0
         times.append(h.isoformat(timespec="minutes"))
         precip.append(amt)
-        prob.append(p)
-        temp.append(tmp.get(h))
-        sm = snowmm.get(h)
-        snow.append((sm / 10.0) if sm is not None else None)  # mm -> cm
         codes.append(_nws_weather_code(wx.get(h)) if amt else None)
 
-    series = {
-        "times": times, "precip": precip, "snow": snow, "prob": prob,
-        "temp": temp, "codes": codes, "step": 60,
+    result = {
+        "times": times,
+        "precip": precip,
+        "codes": codes,
         "now": now.isoformat(timespec="minutes"),
         "current_precip": precip[0] if precip else None,
         "current_code": codes[0] if codes else None,
+        "step": 60,
     }
     if cache_ttl > 0:
         if len(_SERIES_CACHE) >= _SERIES_CACHE_CAP:
             _SERIES_CACHE.pop(next(iter(_SERIES_CACHE)))
-        _SERIES_CACHE[cache_key] = (time.time(), series)
-    return series
+        _SERIES_CACHE[cache_key] = (time.time(), result)
+    return result
 
 
 @dataclass
@@ -702,6 +735,25 @@ class RainCommand(BaseCommand):
         {"name": "location", "description": "Optional: city, US ZIP, or lat,lon. Default: companion or bot location."}
     ]
 
+    # Web-viewer settings schema (see modules/settings_schema.py).
+    # Falls back to [Bot] bot_latitude/longitude when these are unset.
+    settings_schema = [
+        {"key": "default_lat", "label": "Default latitude", "type": "float",
+         "min": -90, "max": 90, "default": "",
+         "help": "Latitude used when no location is given (overrides bot location)."},
+        {"key": "default_lon", "label": "Default longitude", "type": "float",
+         "min": -180, "max": 180, "default": "",
+         "help": "Longitude used when no location is given (overrides bot location)."},
+        {"key": "default_city", "label": "Default city", "type": "str", "section": "Weather",
+         "default": "", "help": "City used for a bare command when no location is given. Shared weather setting."},
+        {"key": "default_state", "label": "Default state", "type": "str", "section": "Weather",
+         "default": "", "help": "2-letter state for city disambiguation (e.g. WA). Shared weather setting."},
+        {"key": "default_country", "label": "Default country", "type": "str", "section": "Weather",
+         "default": "US", "help": "2-letter country code (e.g. US). Shared weather setting."},
+        {"key": "weather_model", "label": "Open-Meteo model", "type": "str", "section": "Weather",
+         "default": "", "help": "Open-Meteo model name; blank = best_match. Shared weather setting."},
+    ]
+
     def __init__(self, bot: Any) -> None:
         super().__init__(bot)
         self.rain_enabled = self.get_config_value("Rain_Command", "enabled", fallback=True, value_type="bool")
@@ -747,6 +799,7 @@ class RainCommand(BaseCommand):
             "Rain_Command", "zip_city_lookup", fallback=True, value_type="bool"
         )
         self._reverse_cache: dict[str, tuple[Optional[str], Optional[str]]] = {}
+        self._zip_cache: dict[str, str] = {}
 
     def can_execute(self, message: MeshMessage, skip_channel_check: bool = False) -> bool:
         if not self.rain_enabled:
@@ -827,8 +880,11 @@ class RainCommand(BaseCommand):
         return self._reverse_geocode(lat, lon)[1]
 
     def _zip_to_city_string(self, zipcode: str) -> Optional[str]:
-        """US ZIP -> 'City, ST' via the shared Zippopotam lookup (module-cached)."""
-        return zip_to_city_string(zipcode, timeout=self.url_timeout, logger=self.logger)
+        """US ZIP -> 'City, ST' via Zippopotam.us (free, no key, cached)."""
+        name = location_zip_to_city_string(
+            zipcode, timeout=self.url_timeout, cache=self._zip_cache, logger=self.logger
+        )
+        return name
 
     def _resolve_location(
         self, message: MeshMessage, location: Optional[str]
@@ -916,22 +972,15 @@ class RainCommand(BaseCommand):
     def _fetch_series(self, lat: float, lon: float) -> Optional[dict]:
         """Fetch the precip series (own short-lived session).
 
-        Prefers the NWS gridpoint (US) so a "!rain"/"!snow" agrees with the
-        proactive rain push — the Open-Meteo model can read 0.0 while NWS shows
-        rain. Falls back to Open-Meteo for non-US locations (no NWS coverage) or
-        on any failure.
+        Prefers the NWS gridpoint (US) so a "!rain"/"!snow" matches the proactive
+        push and reflects the forecaster-adjusted convective chances the Open-Meteo
+        model can miss; falls back to Open-Meteo for non-US locations (no NWS
+        coverage) or on any failure.
         """
         session = self._create_retry_session()
         try:
-            # Same confidence bar as the Weather_Service push, so a command run
-            # right after a rain alert can't contradict it.
-            pop_floor = self.get_config_value(
-                "Weather_Service", "rain_nowcast_min_probability", fallback=50, value_type="int"
-            )
             series = fetch_precip_series_nws(
-                session, lat, lon,
-                timeout=self.url_timeout, logger=self.logger,
-                cache_ttl=self.cache_ttl, pop_floor=pop_floor,
+                session, lat, lon, timeout=self.url_timeout, logger=self.logger,
             )
             if series:
                 return series
@@ -1061,7 +1110,12 @@ class RainCommand(BaseCommand):
             location = cap_query
             region_note = REGION_DEFAULT_NOTE
 
-        lat, lon, location_label, err_key = self._resolve_location(message, location)
+        # Offloaded: _resolve_location geocodes and reverse-geocodes over blocking
+        # HTTP, so running it inline would stall the event loop before we ever
+        # reach the already-offloaded forecast fetch below.
+        lat, lon, location_label, err_key = await asyncio.to_thread(
+            self._resolve_location, message, location
+        )
         if lat is None or lon is None:
             region = self.default_state or self.default_country
             if err_key == "commands.rain.no_location":

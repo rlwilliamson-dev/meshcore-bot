@@ -7,6 +7,8 @@ Contains the main bot class and message processing logic
 import asyncio
 import atexit
 import configparser
+import functools
+import inspect
 import json
 import logging
 import signal
@@ -117,6 +119,50 @@ class _BotAdminServer(threading.Thread):
             self._bot.logger.error("BotAdminServer failed to start: %s", exc)
 
 
+class _SerializedCommands:
+    """Serializing proxy around ``meshcore.commands``.
+
+    The companion firmware processes one host serial frame per main-loop
+    iteration and has no mid-frame resync: a burst of concurrent commands can
+    overrun the radio's USB-CDC RX buffer, drop a byte, and permanently desync
+    its frame parser (commands stop being acted on while RX push frames keep
+    flowing). The bot issues commands from many independent asyncio tasks
+    (sends, channel/contact ops, scheduler ops, health probes, auto message
+    fetch) with no shared serialization.
+
+    This proxy routes every coroutine command through a single per-bot lock and
+    enforces a minimum inter-command interval, guaranteeing at most one
+    in-flight companion frame at a time. Non-coroutine attributes are passed
+    through untouched, so library internals that read ``_sender_func``,
+    ``default_timeout`` etc. are unaffected. ``meshcore_cli.next_cmd`` calls are
+    serialized too, since they dispatch through this same ``commands`` object.
+    """
+
+    __slots__ = ("_bot", "_commands")
+
+    def __init__(self, bot: "MeshCoreBot", commands: Any) -> None:
+        object.__setattr__(self, "_bot", bot)
+        object.__setattr__(self, "_commands", commands)
+
+    def __getattr__(self, name: str) -> Any:
+        commands = object.__getattribute__(self, "_commands")
+        attr = getattr(commands, name)
+        if not inspect.iscoroutinefunction(attr):
+            return attr
+        bot = object.__getattribute__(self, "_bot")
+
+        @functools.wraps(attr)
+        async def _serialized(*args: Any, **kwargs: Any) -> Any:
+            async with bot._get_radio_cmd_lock():
+                await bot._pace_radio_command()
+                return await attr(*args, **kwargs)
+
+        return _serialized
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(object.__getattribute__(self, "_commands"), name, value)
+
+
 class MeshCoreBot:
     """MeshCore Bot using official meshcore package.
 
@@ -126,6 +172,10 @@ class MeshCoreBot:
 
     def __init__(self, config_file: str = "config.ini"):
         self.config_file = config_file
+        # Reload writers are serialized, while readers rely on the atomic
+        # replacement of this parser reference.  Never mutate a published
+        # ConfigParser in place: readers do not take this lock.
+        self._config_reload_lock = threading.RLock()
         self.config = configparser.ConfigParser()
         self.load_config()
 
@@ -236,17 +286,30 @@ class MeshCoreBot:
             else:
                 language = 'en'
                 translation_path = 'translations/'
+            self.translation_path = translation_path
+            self._translator_cache: dict[str, Any] = {}
             self.translator = Translator(language, translation_path)
+            self._translator_cache[language] = self.translator
             self.logger.info(f"Localization initialized: {language}")
         except (OSError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
             self.logger.warning(f"Failed to initialize translator: {e}")
             # Create a dummy translator that just returns keys
             class DummyTranslator:
+                language = 'en'
+                base_language = 'en'
+
                 def translate(self, key, **kwargs):
                     return key
+
                 def get_value(self, key):
                     return None
+
+                def get_available_languages(self):
+                    return []
+
             self.translator = DummyTranslator()
+            self.translation_path = 'translations/'
+            self._translator_cache = {}
 
         # Initialize solar conditions configuration
         set_config(self.config)
@@ -354,6 +417,20 @@ class MeshCoreBot:
         self._transport_reconnect_lock: asyncio.Lock | None = None
         self._transport_reconnect_in_progress = False
 
+        # Serialize host->radio commands: one companion frame in flight at a
+        # time, with a minimum inter-command gap so the firmware's single
+        # serial loop can drain its RX buffer between frames. Prevents the
+        # USB-CDC overrun / parser-desync failure mode. Lock is created lazily
+        # once an event loop is running (see _get_radio_cmd_lock).
+        self._radio_cmd_lock: asyncio.Lock | None = None
+        self._radio_cmd_last_ts: float = 0.0
+        self._radio_cmd_min_interval = max(
+            0.0,
+            self.config.getfloat(
+                'Connection', 'command_min_interval_ms', fallback=30.0
+            ) / 1000.0,
+        )
+
     @property
     def bot_root(self) -> Path:
         """Get bot root directory (where config.ini is located)"""
@@ -402,7 +479,7 @@ class MeshCoreBot:
         )
         if self._send_consecutive_failures >= threshold and not self.is_radio_offline:
             self._radio_offline = True
-            since = _dt.datetime.now(_dt.UTC).isoformat()
+            since = _dt.datetime.now(_dt.timezone.utc).isoformat()
             self.logger.critical(
                 "RADIO OFFLINE: %d consecutive send timeouts (threshold %d). "
                 "Bot will suppress further outbound sends until one succeeds. "
@@ -451,41 +528,60 @@ class MeshCoreBot:
         if not Path(self.config_file).exists():
             self.create_default_config()
 
-        # Force UTF-8 so emoji and non-ASCII characters in config.ini parse on Windows.
-        self.config.read(self.config_file, encoding="utf-8")
-        # Resolve local plugins directory from [Bot] local_dir_path (default: local)
-        self._local_root = Path(
+        self.config, self._local_root = self._read_config_snapshot()
+
+    def _read_config_snapshot(self) -> tuple[configparser.ConfigParser, Path]:
+        """Read base and local overlay into a new, unpublished parser.
+
+        ``ConfigParser.read`` mutates its receiver.  Keeping that receiver
+        private until both files have parsed guarantees that concurrent readers
+        only ever observe a complete old or complete new snapshot.
+        """
+        snapshot = configparser.ConfigParser()
+        loaded = snapshot.read(self.config_file, encoding="utf-8")
+        if not loaded:
+            raise FileNotFoundError(self.config_file)
+
+        # The overlay location is selected by the base file.  An overlay cannot
+        # silently relocate itself midway through the same read operation.
+        local_root = Path(
             resolve_path(
-                self.config.get("Bot", "local_dir_path", fallback="local"),
+                snapshot.get("Bot", "local_dir_path", fallback="local"),
                 self.bot_root,
             )
         )
-        # Merge local config if present (user plugins/services settings)
-        local_config = self._local_root / "config.ini"
+        local_config = local_root / "config.ini"
         if local_config.exists():
-            self.config.read(local_config, encoding="utf-8")
+            snapshot.read(local_config, encoding="utf-8")
+        return snapshot, local_root
 
-    def _get_radio_settings(self) -> dict[str, Any]:
+    def _get_radio_settings(
+        self, config: configparser.ConfigParser | None = None
+    ) -> dict[str, Any]:
         """Get current radio/connection settings from config.
 
         Returns:
             Dict[str, Any]: Dictionary containing all radio-related settings.
         """
+        source = config if config is not None else self.config
         return {
-            'connection_type': self.config.get('Connection', 'connection_type', fallback='ble').lower(),
-            'serial_port': self.config.get('Connection', 'serial_port', fallback=''),
-            'ble_device_name': self.config.get('Connection', 'ble_device_name', fallback=''),
-            'hostname': self.config.get('Connection', 'hostname', fallback=''),
-            'tcp_port': self.config.getint('Connection', 'tcp_port', fallback=5000),
-            'timeout': self.config.getint('Connection', 'timeout', fallback=30),
+            'connection_type': source.get('Connection', 'connection_type', fallback='ble').lower(),
+            'serial_port': source.get('Connection', 'serial_port', fallback=''),
+            'ble_device_name': source.get('Connection', 'ble_device_name', fallback=''),
+            'hostname': source.get('Connection', 'hostname', fallback=''),
+            'tcp_port': source.getint('Connection', 'tcp_port', fallback=5000),
+            'timeout': source.getint('Connection', 'timeout', fallback=30),
             # radio_debug intentionally excluded — only needs a reconnect, not a full restart
         }
 
-    def _load_channel_rate_limiter(self) -> ChannelRateLimiter:
+    def _load_channel_rate_limiter(
+        self, config: configparser.ConfigParser | None = None
+    ) -> ChannelRateLimiter:
         """Build a ChannelRateLimiter from [Rate_Limits] channel.<name>_seconds keys."""
         limits: dict[str, float] = {}
-        if self.config.has_section('Rate_Limits'):
-            for key, value in self.config.items('Rate_Limits'):
+        source = config if config is not None else self.config
+        if source.has_section('Rate_Limits'):
+            for key, value in source.items('Rate_Limits'):
                 if key.startswith('channel.') and key.endswith('_seconds'):
                     channel_name = key[len('channel.'):-len('_seconds')]
                     try:
@@ -494,6 +590,189 @@ class MeshCoreBot:
                     except ValueError:
                         self.logger.warning(f"Invalid channel rate limit for {key}: {value!r}")
         return ChannelRateLimiter(limits)
+
+    def _available_translation_codes(self) -> set[str]:
+        """Return concrete locale codes from filesystem or bundled catalogs."""
+        try:
+            return {
+                code
+                for code in self.translator.get_available_languages()
+                if code
+            }
+        except (AttributeError, OSError) as e:
+            self.logger.debug("Could not enumerate translation files: %s", e)
+            return set()
+
+    def get_translator(self, language: str) -> Any:
+        """Return a cached translator without changing the bot-wide default."""
+        if not language:
+            return self.translator
+        available_codes = self._available_translation_codes()
+        resolved_language = language
+        if language not in available_codes:
+            locale_matches = sorted(
+                code
+                for code in available_codes
+                if code.replace("_", "-").split("-", 1)[0] == language
+            )
+            if locale_matches:
+                resolved_language = locale_matches[0]
+        cached = self._translator_cache.get(resolved_language)
+        if cached is not None:
+            return cached
+        try:
+            translator = Translator(resolved_language, self.translation_path)
+        except (OSError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
+            self.logger.warning(
+                "Failed to build translator for %r: %s", resolved_language, e
+            )
+            return self.translator
+        self._translator_cache[resolved_language] = translator
+        return translator
+
+    def available_languages(self) -> set[str]:
+        """Return detectable base languages from filesystem or bundled catalogs."""
+        available = {
+            language.replace("_", "-").split("-", 1)[0]
+            for language in self._available_translation_codes()
+            if language
+        }
+        available.add(
+            getattr(self.translator, "base_language", None)
+            or getattr(self.translator, "language", "en")
+        )
+        return available
+
+    @staticmethod
+    def _config_section_values(
+        config: configparser.ConfigParser, section: str
+    ) -> dict[str, str]:
+        if not config.has_section(section):
+            return {}
+        return dict(config.items(section, raw=True))
+
+    def _restart_only_config_changes(
+        self,
+        old_config: configparser.ConfigParser,
+        new_config: configparser.ConfigParser,
+    ) -> list[str]:
+        """Return changed settings whose owning component is startup-only.
+
+        Service plugins commonly cache constructor settings.  Until they expose
+        a transactional reload contract, rejecting those edits is safer than a
+        split state where on-demand reads see new values and cached fields do not.
+        """
+        changed: list[str] = []
+        # Built-in services may currently be disabled and therefore absent from
+        # ``self.services``.  Their enable flags and constructor-cached settings
+        # are still restart-only; otherwise a successful reload would claim to
+        # start a service that was never instantiated.
+        startup_sections = {
+            "Admin",
+            "Connection",
+            "DARC_MoWaS_Service",
+            "DiscordBridge",
+            "Earthquake_Service",
+            "Feed_Manager",
+            "Logging",
+            "MapUploader",
+            "MqttWeather",
+            "PacketCapture",
+            "RepeaterPrefixCollision_Service",
+            "Service_Overrides",
+            "TelegramBridge",
+            "Weather_Service",
+            "Webhook",
+            "Web_Viewer",
+            "Worldcup_Service",
+        }
+        for service in getattr(self, "services", {}).values():
+            section = getattr(service, "config_section", None)
+            if not section:
+                derive = getattr(service, "_derive_config_section", None)
+                if callable(derive):
+                    section = derive()
+            if isinstance(section, str) and section:
+                startup_sections.add(section)
+            if service.__class__.__name__ == "WeatherService":
+                # WeatherService also caches units from the shared [Weather]
+                # section during construction.
+                startup_sections.add("Weather")
+
+        for section in sorted(startup_sections):
+            if self._config_section_values(old_config, section) != self._config_section_values(
+                new_config, section
+            ):
+                changed.append(f"[{section}]")
+
+        for key in ("db_path", "local_dir_path", "prefix_bytes"):
+            old_value = old_config.get("Bot", key, fallback="")
+            new_value = new_config.get("Bot", key, fallback="")
+            if old_value != new_value:
+                changed.append(f"[Bot] {key}")
+        return changed
+
+    @staticmethod
+    def _validate_config_snapshot(config: configparser.ConfigParser) -> None:
+        """Validate the fully merged candidate before it can be published."""
+        from .config_schema import SECTIONS
+        from .config_validation import REQUIRED_SECTIONS
+
+        missing = sorted(REQUIRED_SECTIONS - set(config.sections()))
+        if missing:
+            raise ValueError(
+                "Missing required configuration section(s): " + ", ".join(missing)
+            )
+
+        # Expand interpolation across every final value, not just the base file.
+        # This catches malformed '%' expressions in an overlay before publish.
+        for section in config.sections():
+            list(config.items(section))
+
+        # Validate all typed keys currently covered by the project schema.
+        for section, section_meta in SECTIONS.items():
+            if not config.has_section(section):
+                continue
+            for key, meta in section_meta.keys.items():
+                if not config.has_option(section, key):
+                    continue
+                if meta.type == "int":
+                    config.getint(section, key)
+                elif meta.type == "bool":
+                    config.getboolean(section, key)
+                elif meta.type == "enum" and meta.values:
+                    value = config.get(section, key).strip().lower()
+                    if value not in meta.values:
+                        raise ValueError(
+                            f"[{section}] {key} must be one of "
+                            f"{', '.join(meta.values)} (got {value!r})"
+                        )
+
+    _COMMAND_CONFIG_STATE = (
+        "keywords",
+        "custom_syntax",
+        "banned_users",
+        "monitor_channels",
+        "channel_keywords",
+        "command_prefixes",
+        "require_command_prefix",
+        "_command_prefix_default",
+        "flood_scope_allow_global",
+        "flood_scope_keys",
+        "plugin_loader",
+        "commands",
+    )
+
+    @classmethod
+    def _command_config_state(cls, manager: CommandManager) -> dict[str, Any]:
+        return {name: getattr(manager, name) for name in cls._COMMAND_CONFIG_STATE}
+
+    @classmethod
+    def _apply_command_config_state(
+        cls, manager: CommandManager, state: dict[str, Any]
+    ) -> None:
+        for name in cls._COMMAND_CONFIG_STATE:
+            setattr(manager, name, state[name])
 
     def reload_config(self) -> tuple[bool, str]:
         """Reload configuration from file without restarting the bot.
@@ -507,123 +786,175 @@ class MeshCoreBot:
                 and a descriptive message.
         """
         try:
-            # Store current radio settings before reload
-            old_radio_settings = self._get_radio_settings()
+            with self._config_reload_lock:
+                old_config = self.config
+                if not Path(self.config_file).exists():
+                    return (False, "Config file not found")
+                new_config, new_local_root = self._read_config_snapshot()
+                self._validate_config_snapshot(new_config)
 
-            # Create a temporary config parser to check new settings
-            import configparser
-            new_config = configparser.ConfigParser()
-            if not Path(self.config_file).exists():
-                return (False, "Config file not found")
+                old_radio_settings = self._get_radio_settings(old_config)
+                new_radio_settings = self._get_radio_settings(new_config)
+                if old_radio_settings != new_radio_settings:
+                    changed_settings = [
+                        f"{key}: {old_radio_settings[key]} -> {new_radio_settings[key]}"
+                        for key in old_radio_settings
+                        if old_radio_settings[key] != new_radio_settings[key]
+                    ]
+                    return (
+                        False,
+                        "Radio settings changed. Restart required. Changes: "
+                        + ", ".join(changed_settings),
+                    )
 
-            new_config.read(self.config_file, encoding="utf-8")
+                restart_changes = self._restart_only_config_changes(old_config, new_config)
+                if restart_changes:
+                    return (
+                        False,
+                        "Startup-only or cached service settings changed. Restart required: "
+                        + ", ".join(restart_changes),
+                    )
 
-            # Get new radio settings
-            new_radio_settings = {
-                'connection_type': new_config.get('Connection', 'connection_type', fallback='ble').lower(),
-                'serial_port': new_config.get('Connection', 'serial_port', fallback=''),
-                'ble_device_name': new_config.get('Connection', 'ble_device_name', fallback=''),
-                'hostname': new_config.get('Connection', 'hostname', fallback=''),
-                'tcp_port': new_config.getint('Connection', 'tcp_port', fallback=5000),
-                'timeout': new_config.getint('Connection', 'timeout', fallback=30),
-                # radio_debug excluded — only needs a reconnect, not a full restart
-            }
+                # Typed reads validate the final merged snapshot and prepare all
+                # independent replacements before the live reference is changed.
+                new_rate_limiter = RateLimiter(
+                    new_config.getint('Bot', 'rate_limit_seconds', fallback=10)
+                )
+                new_bot_tx_rate_limiter = BotTxRateLimiter(
+                    new_config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
+                )
+                new_per_user_enabled = new_config.getboolean(
+                    'Bot', 'per_user_rate_limit_enabled', fallback=True
+                )
+                new_per_user_rate_limiter = PerUserRateLimiter(
+                    seconds=new_config.getfloat(
+                        'Bot', 'per_user_rate_limit_seconds', fallback=5.0
+                    ),
+                    max_entries=1000,
+                )
+                new_nominatim_rate_limiter = NominatimRateLimiter(
+                    new_config.getfloat(
+                        'Bot', 'nominatim_rate_limit_seconds', fallback=1.1
+                    )
+                )
+                new_channel_rate_limiter = self._load_channel_rate_limiter(new_config)
+                new_tx_delay_ms = new_config.getint('Bot', 'tx_delay_ms', fallback=250)
+                new_max_channels = new_config.getint('Bot', 'max_channels', fallback=40)
 
-            # Check if radio settings changed
-            if old_radio_settings != new_radio_settings:
-                changed_settings = []
-                for key in old_radio_settings:
-                    if old_radio_settings[key] != new_radio_settings[key]:
-                        changed_settings.append(f"{key}: {old_radio_settings[key]} -> {new_radio_settings[key]}")
-                return (False, f"Radio settings changed. Restart required. Changes: {', '.join(changed_settings)}")
+                new_language = new_config.get('Localization', 'language', fallback='en')
+                new_translation_path = new_config.get(
+                    'Localization', 'translation_path', fallback='translations/'
+                )
+                new_translator = Translator(new_language, new_translation_path)
+                new_translator_cache = {new_language: new_translator}
 
-            # Radio settings unchanged, proceed with reload
-            self.logger.info("Reloading configuration (radio settings unchanged)")
+                old_state = {
+                    "config": old_config,
+                    "local_root": self._local_root,
+                    "rate_limiter": self.rate_limiter,
+                    "bot_tx_rate_limiter": self.bot_tx_rate_limiter,
+                    "per_user_rate_limit_enabled": self.per_user_rate_limit_enabled,
+                    "per_user_rate_limiter": self.per_user_rate_limiter,
+                    "nominatim_rate_limiter": self.nominatim_rate_limiter,
+                    "channel_rate_limiter": self.channel_rate_limiter,
+                    "tx_delay_ms": self.tx_delay_ms,
+                    "translator": self.translator,
+                    "translation_path": self.translation_path,
+                    "translator_cache": self._translator_cache,
+                    "command_config_state": self._command_config_state(
+                        self.command_manager
+                    ),
+                    "max_channels": self.channel_manager.max_channels,
+                }
 
-            # Reload the config
-            self.config.read(self.config_file, encoding="utf-8")
-            local_config = self._local_root / "config.ini"
-            if local_config.exists():
-                self.config.read(local_config, encoding="utf-8")
-
-            # Update rate limiters
-            new_rate_limit = self.config.getint('Bot', 'rate_limit_seconds', fallback=10)
-            self.rate_limiter = RateLimiter(new_rate_limit)
-
-            new_bot_tx_rate_limit = self.config.getfloat('Bot', 'bot_tx_rate_limit_seconds', fallback=1.0)
-            self.bot_tx_rate_limiter = BotTxRateLimiter(new_bot_tx_rate_limit)
-
-            self.per_user_rate_limit_enabled = self.config.getboolean(
-                'Bot', 'per_user_rate_limit_enabled', fallback=True
-            )
-            new_per_user_seconds = self.config.getfloat('Bot', 'per_user_rate_limit_seconds', fallback=5.0)
-            self.per_user_rate_limiter = PerUserRateLimiter(seconds=new_per_user_seconds, max_entries=1000)
-
-            new_nominatim_rate_limit = self.config.getfloat('Bot', 'nominatim_rate_limit_seconds', fallback=1.1)
-            self.nominatim_rate_limiter = NominatimRateLimiter(new_nominatim_rate_limit)
-
-            self.channel_rate_limiter = self._load_channel_rate_limiter()
-
-            # Update transmission delay
-            self.tx_delay_ms = self.config.getint('Bot', 'tx_delay_ms', fallback=250)
-
-            # Update translator if language changed
-            try:
-                if self.config.has_section('Localization'):
-                    new_language = self.config.get('Localization', 'language', fallback='en')
-                    new_translation_path = self.config.get('Localization', 'translation_path', fallback='translations/')
-                else:
-                    new_language = 'en'
-                    new_translation_path = 'translations/'
-                if (not hasattr(self, 'translator') or
-                    getattr(self.translator, 'language', None) != new_language or
-                    getattr(self.translator, 'translation_path', None) != new_translation_path):
-                    self.translator = Translator(new_language, new_translation_path)
-                    self.logger.info(f"Translator reloaded with language: {new_language}")
-
-                    # Reload translated keywords for all commands
-                    if hasattr(self, 'command_manager'):
-                        for _cmd_name, cmd_instance in self.command_manager.commands.items():
-                            if hasattr(cmd_instance, '_load_translated_keywords'):
-                                cmd_instance._load_translated_keywords()
-            except (OSError, ValueError, FileNotFoundError, json.JSONDecodeError) as e:
-                self.logger.warning(f"Failed to reload translator: {e}")
-
-            # Update solar conditions config
-            set_config(self.config)
-
-            # Update command manager (keywords, custom syntax, banned users, monitor channels)
-            if hasattr(self, 'command_manager'):
-                self.command_manager.keywords = self.command_manager.load_keywords()
-                self.command_manager.custom_syntax = self.command_manager.load_custom_syntax()
-                self.command_manager.banned_users = self.command_manager.load_banned_users()
-                self.command_manager.monitor_channels = self.command_manager.load_monitor_channels()
-                self.command_manager.channel_keywords = self.command_manager.load_channel_keywords()
-                self.logger.info("Command manager config reloaded")
-
-            # Update scheduler (scheduled messages)
-            if hasattr(self, 'scheduler'):
-                self.scheduler.setup_scheduled_messages()
-                self.logger.info("Scheduler config reloaded")
-
-            # Update channel manager max_channels if changed
-            if hasattr(self, 'channel_manager'):
-                new_max_channels = self.config.getint('Bot', 'max_channels', fallback=40)
-                if hasattr(self.channel_manager, 'max_channels'):
-                    old_max_channels = self.channel_manager.max_channels
+                scheduler_apply_started = False
+                try:
+                    # Atomic complete-snapshot publication.  Component reference
+                    # swaps follow under the single-writer lock and are all
+                    # restored if any component rejects the candidate.
+                    self.config = new_config
+                    self._local_root = new_local_root
+                    self.rate_limiter = new_rate_limiter
+                    self.bot_tx_rate_limiter = new_bot_tx_rate_limiter
+                    self.per_user_rate_limit_enabled = new_per_user_enabled
+                    self.per_user_rate_limiter = new_per_user_rate_limiter
+                    self.nominatim_rate_limiter = new_nominatim_rate_limiter
+                    self.channel_rate_limiter = new_channel_rate_limiter
+                    self.tx_delay_ms = new_tx_delay_ms
+                    self.translation_path = new_translation_path
+                    self._translator_cache = new_translator_cache
+                    self.translator = new_translator
+                    # Commands and nested delegates require the real bot. They
+                    # are therefore constructed after candidate publication,
+                    # inside the rollback boundary, rather than against a
+                    # facade that could leak into nested objects.
+                    new_command_manager = CommandManager(self)
+                    old_plugin_failures = (
+                        self.command_manager.plugin_loader.get_failed_plugins()
+                    )
+                    new_plugin_failures = (
+                        new_command_manager.plugin_loader.get_failed_plugins()
+                    )
+                    introduced_failures = {
+                        name: reason
+                        for name, reason in new_plugin_failures.items()
+                        if old_plugin_failures.get(name) != reason
+                    }
+                    if introduced_failures:
+                        names = ", ".join(sorted(introduced_failures))
+                        raise ValueError(
+                            f"Command plugin reload failed for: {names}"
+                        )
+                    self._apply_command_config_state(
+                        self.command_manager,
+                        self._command_config_state(new_command_manager),
+                    )
                     self.channel_manager.max_channels = new_max_channels
-                    if old_max_channels != new_max_channels:
-                        self.logger.info(f"Channel manager max_channels updated to {new_max_channels}")
-                # Note: We don't invalidate the channel cache here because channels are fetched
-                # from the device, not from config. The cache should remain valid after reload.
+                    set_config(new_config)
 
-            # Note: Service plugins check config on-demand, so they'll pick up changes automatically
-            # Feed manager and other services that need explicit reload can be added here if needed
+                    if hasattr(self, 'scheduler'):
+                        scheduler_apply_started = True
+                        self.scheduler.setup_scheduled_messages()
+                        self.logger.info("Scheduler config reloaded")
+                except (Exception, SystemExit):
+                    self.config = old_state["config"]
+                    self._local_root = old_state["local_root"]
+                    self.rate_limiter = old_state["rate_limiter"]
+                    self.bot_tx_rate_limiter = old_state["bot_tx_rate_limiter"]
+                    self.per_user_rate_limit_enabled = old_state[
+                        "per_user_rate_limit_enabled"
+                    ]
+                    self.per_user_rate_limiter = old_state["per_user_rate_limiter"]
+                    self.nominatim_rate_limiter = old_state["nominatim_rate_limiter"]
+                    self.channel_rate_limiter = old_state["channel_rate_limiter"]
+                    self.tx_delay_ms = old_state["tx_delay_ms"]
+                    self.translator = old_state["translator"]
+                    self.translation_path = old_state["translation_path"]
+                    self._translator_cache = old_state["translator_cache"]
+                    self._apply_command_config_state(
+                        self.command_manager, old_state["command_config_state"]
+                    )
+                    self.channel_manager.max_channels = old_state["max_channels"]
+                    set_config(old_config)
+                    # setup_scheduled_messages may have stopped the previous
+                    # APScheduler before failing. Rebuild it against old config.
+                    if scheduler_apply_started and hasattr(self, 'scheduler'):
+                        try:
+                            self.scheduler.setup_scheduled_messages()
+                        except Exception as rollback_error:
+                            self.logger.error(
+                                "Scheduler rollback failed: %s", rollback_error
+                            )
+                    raise
 
-            self.logger.info("Configuration reloaded successfully")
-            return (True, "Configuration reloaded successfully")
+                self.logger.info("Configuration reloaded successfully")
+                return (
+                    True,
+                    "Configuration reloaded successfully. Active service plugin and "
+                    "process settings remain startup-only and require restart.",
+                )
 
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             error_msg = f"Error reloading configuration: {e}"
             self.logger.error(error_msg)
             import traceback
@@ -638,23 +969,15 @@ class MeshCoreBot:
         """
         default_config = """[Connection]
 # Connection type: serial, ble, or tcp
-# serial: Connect via USB serial port
-# ble: Connect via Bluetooth Low Energy
-# tcp: Connect via TCP/IP
+# Precedence: only keys for the active connection_type are used; others are ignored.
+#   serial -> serial_port | ble -> ble_device_name | tcp -> hostname, tcp_port
 connection_type = serial
 
-# Serial port (for serial connection)
-# Common ports: /dev/ttyUSB0, /dev/tty.usbserial-*, COM3 (Windows)
 serial_port = /dev/ttyUSB0
 
-# BLE device name (for BLE connection)
-# Leave commented out for auto-detection, or specify exact device name
-#ble_device_name = MeshCore
-
-# TCP hostname or IP address (for TCP connection)
-#hostname = 192.168.1.60
-# TCP port (for TCP connection)
-#tcp_port = 5000
+ble_device_name =
+hostname =
+tcp_port = 5000
 
 # Connection timeout in seconds
 timeout = 30
@@ -745,10 +1068,10 @@ advert_interval_hours = 0
 startup_advert = false
 
 # Auto-manage contact list when new contacts are discovered
-# device: Device handles auto-addition using standard auto-discovery mode, bot manages contact list capacity (purge old contacts when near limits)
+# device: Device handles auto-addition using standard auto-discovery mode, bot manages contact list capacity (purge old contacts when near limits) (default)
 # bot: Bot automatically adds new companion contacts to device, bot manages contact list capacity (purge old contacts when near limits)
-# false: Manual mode - no automatic actions, use !repeater commands to manage contacts (default)
-auto_manage_contacts = false
+# false: Manual mode - no automatic actions, use !repeater commands to manage contacts
+auto_manage_contacts = device
 
 [Admin_ACL]
 # Admin Access Control List (ACL) for restricted commands
@@ -834,17 +1157,6 @@ colored_output = true
 # Controls debug output from the meshcore library itself
 # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
 meshcore_log_level = INFO
-
-[Custom_Syntax]
-# Custom syntax patterns for special message formats
-# Format: pattern = "response_format"
-# Available fields: {sender}, {phrase}, {connection_info}, {snr}, {timestamp}, {path}
-# {phrase}: The text after the trigger (for t_phrase syntax)
-#
-# Special syntax: Messages starting with "t " or "T " followed by a phrase
-# Example: "t hello world" -> "ack {sender}: hello world | {connection_info}"
-t_phrase = "ack {sender}: {phrase} | {connection_info}"
-
 
 [External_Data]
 # Weather API key (future feature)
@@ -1241,14 +1553,14 @@ long_jokes = false
 
         Reads reconnect settings from [Connection]:
           reconnect_max_retries  – max attempts before giving up (0 = unlimited, default 0)
-          reconnect_delay_seconds – initial wait between attempts (default 5)
+          reconnect_delay_seconds – initial wait between attempts (default 10)
           reconnect_max_delay_seconds – cap on wait time (default 60)
 
         Returns:
             bool: True if reconnection succeeded, False if max retries exhausted or shutdown.
         """
         max_retries = self.config.getint('Connection', 'reconnect_max_retries', fallback=0)
-        delay = self.config.getfloat('Connection', 'reconnect_delay_seconds', fallback=5.0)
+        delay = self.config.getfloat('Connection', 'reconnect_delay_seconds', fallback=10.0)
         max_delay = self.config.getfloat('Connection', 'reconnect_max_delay_seconds', fallback=60.0)
 
         attempt = 0
@@ -1349,6 +1661,52 @@ long_jokes = false
         finally:
             self._transport_reconnect_in_progress = False
 
+    def _get_radio_cmd_lock(self) -> asyncio.Lock:
+        """Return the lock that serializes host->radio commands.
+
+        Created lazily so it binds to the running event loop.
+        """
+        if self._radio_cmd_lock is None:
+            self._radio_cmd_lock = asyncio.Lock()
+        return self._radio_cmd_lock
+
+    async def _pace_radio_command(self) -> None:
+        """Enforce a minimum gap between consecutive companion frames.
+
+        Must be called while holding the radio command lock so the timestamp
+        bookkeeping stays serialized.
+        """
+        interval = self._radio_cmd_min_interval
+        if interval <= 0:
+            return
+        now = time.monotonic()
+        wait = interval - (now - self._radio_cmd_last_ts)
+        if wait > 0:
+            await asyncio.sleep(wait)
+        self._radio_cmd_last_ts = time.monotonic()
+
+    def _install_command_serializer(self) -> None:
+        """Wrap ``meshcore.commands`` so every command is serialized + paced.
+
+        Idempotent and safe to call after each (re)connect. Wrapping the
+        ``commands`` attribute in place means existing call sites
+        (``self.meshcore.commands.*`` and ``meshcore_cli.next_cmd``) are
+        serialized automatically with no per-call changes.
+        """
+        if not self.meshcore:
+            return
+        cmds = getattr(self.meshcore, "commands", None)
+        if cmds is None or isinstance(cmds, _SerializedCommands):
+            return
+        try:
+            self.meshcore.commands = _SerializedCommands(self, cmds)
+            self.logger.debug(
+                "Installed serialized command gateway (min interval %.0fms)",
+                self._radio_cmd_min_interval * 1000,
+            )
+        except (AttributeError, TypeError) as e:
+            self.logger.warning(f"Could not install command serializer: {e}")
+
     async def connect(self) -> bool:
         """Connect to MeshCore node using official package.
 
@@ -1399,6 +1757,10 @@ long_jokes = false
 
             # Route meshcore library output through the bot's handlers (including log file)
             self._configure_meshcore_debug_logging(radio_debug)
+
+            # Serialize all host->radio commands before issuing any (the connect
+            # init burst — contacts, channel fetch, clock, name — runs through it).
+            self._install_command_serializer()
 
             if self.meshcore and self.meshcore.is_connected:
                 self.connected = True
@@ -1551,7 +1913,7 @@ long_jokes = false
                 self.db_manager.set_metadata('bot.radio_zombie', 'true')
                 self.db_manager.set_metadata(
                     'bot.radio_zombie_since',
-                    _dt.datetime.now(_dt.UTC).isoformat(),
+                    _dt.datetime.now(_dt.timezone.utc).isoformat(),
                 )
             except Exception:
                 pass
@@ -1891,6 +2253,20 @@ long_jokes = false
             self.web_viewer_integration.start_viewer()
             self.logger.info("Web viewer started (early, before radio connect)")
 
+        # Start the inbound webhook service early too (before radio connect). Unlike
+        # the other service plugins, this one accepts inbound connections — starting
+        # it late leaves a window (proportional to how long radio connect() takes)
+        # where external callers get connection-refused instead of a clear response.
+        # The handler itself gates on self.connected and returns 503 until the mesh
+        # link is actually ready, so it's safe to bind before we're connected.
+        webhook_service = self.services.get('webhook')
+        if webhook_service is not None and getattr(webhook_service, 'enabled', False):
+            try:
+                await webhook_service.start()
+                self.logger.info("Service 'webhook' started (early, before radio connect)")
+            except Exception as e:
+                self.logger.error(f"Failed to start service 'webhook' early: {e}")
+
         # Connect to MeshCore node
         if not await self.connect():
             self.logger.error("Failed to connect to MeshCore node")
@@ -1933,8 +2309,10 @@ long_jokes = false
         # Send startup advert if enabled
         await self.send_startup_advert()
 
-        # Start all loaded services
+        # Start all loaded services (webhook already started early, before radio connect)
         for service_name, service_instance in self.services.items():
+            if service_name == 'webhook':
+                continue
             try:
                 await service_instance.start()
                 self.logger.info(f"Service '{service_name}' started")

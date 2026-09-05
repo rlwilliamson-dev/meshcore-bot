@@ -7,11 +7,9 @@ asserts on the heads-up that gets pushed — in particular the probability gate
 can still fire later), snow depth, the rain-ending notice, and once-per-episode
 dedup.
 
-Port-safety: the reply is captured at bot.command_manager.send_channel_message,
-which BOTH the upstream single-channel send and the WX-bot local multi-channel
-_send_to_channels route through. With a single rain_channel configured, each
-fires exactly one send, so this test passes unchanged on the fork (where the
-send seam is single-channel) — it never references any local-mod-only name.
+Sends are captured at bot.command_manager.send_channel_message; with a single
+rain_channel configured the proactive push results in exactly one send, which
+the assertions check.
 """
 
 import asyncio
@@ -64,7 +62,7 @@ def build_service(series, monkeypatch, *, overrides=None):
     service._cached_rain_location = "Nashville, TN"
     # get_mesh_flood_scope lazily imports heavy deps; stub it.
     service.get_mesh_flood_scope = Mock(return_value=None)
-    # NWS gridpoint is now tried first; return None here ("no coverage") so these
+    # NWS gridpoint is tried first now; return None ("no coverage") so these
     # source-agnostic nowcast-logic tests run on the canned Open-Meteo series.
     monkeypatch.setattr(
         "modules.service_plugins.weather_service.fetch_precip_series_nws",
@@ -75,6 +73,78 @@ def build_service(series, monkeypatch, *, overrides=None):
         lambda *a, **k: series,
     )
     return service, sends
+
+
+# --- NWS path (WeatherService passes cache_ttl) ------------------------------
+
+def test_nws_path_accepts_cache_ttl_without_crashing(monkeypatch):
+    """Proactive poll calls fetch_precip_series_nws(..., cache_ttl=...); must not TypeError."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    base = now.replace(minute=0, second=0, microsecond=0)
+    nws_series = {
+        "times": [(base + timedelta(hours=i)).isoformat(timespec="minutes") for i in range(3)],
+        "precip": [0.0, 0.5, 0.5],
+        "codes": [None, 61, 61],
+        "now": now.isoformat(timespec="minutes"),
+        "current_precip": 0.0,
+        "current_code": None,
+        "step": 60,
+    }
+    nws_kwargs: list[dict] = []
+    open_meteo_called: list[bool] = []
+
+    def fake_nws(*_a, **kwargs):
+        nws_kwargs.append(kwargs)
+        return nws_series
+
+    def fake_open_meteo(*_a, **_k):
+        open_meteo_called.append(True)
+        return None
+
+    cfg = configparser.ConfigParser()
+    cfg.add_section("Weather")
+    cfg.add_section("Weather_Service")
+    cfg.set("Weather_Service", "my_position_lat", "36.16")
+    cfg.set("Weather_Service", "my_position_lon", "-86.78")
+    cfg.set("Weather_Service", "rain_nowcast_enabled", "true")
+    cfg.set("Weather_Service", "rain_channel", "weather")
+    cfg.set("Weather_Service", "rain_nowcast_cache_seconds", "300")
+
+    bot = Mock()
+    bot.logger = Mock()
+    bot.config = cfg
+    bot.db_manager = Mock()
+
+    sends: list[tuple[str, str]] = []
+
+    async def _send(channel, text, **kwargs):
+        sends.append((channel, text))
+        return True
+
+    bot.command_manager.send_channel_message = _send
+
+    monkeypatch.setattr(
+        "modules.service_plugins.weather_service.fetch_precip_series_nws", fake_nws
+    )
+    monkeypatch.setattr(
+        "modules.service_plugins.weather_service.fetch_precip_series", fake_open_meteo
+    )
+
+    service = WeatherService(bot)
+    service.api_session = Mock()
+    service._cached_rain_location = "Nashville, TN"
+    service.get_mesh_flood_scope = Mock(return_value=None)
+
+    asyncio.run(service._check_rain_nowcast())
+
+    assert nws_kwargs, "NWS fetch should have been tried"
+    assert nws_kwargs[0].get("cache_ttl") == 300
+    assert open_meteo_called == [], "Open-Meteo fallback should not run when NWS succeeds"
+    assert len(sends) == 1
+    assert "Heads up" in sends[0][1]
+    bot.logger.error.assert_not_called()
 
 
 # --- probability gate -------------------------------------------------------
@@ -92,19 +162,6 @@ def test_incoming_above_threshold_pushes(monkeypatch):
     assert service._rain_start_announced is True
     assert service._last_rain_start_time is not None
     assert len(text.encode("utf-8")) <= 145
-
-
-def test_nws_source_preferred_over_open_meteo(monkeypatch):
-    # NWS gridpoint is tried first: when it returns a usable series the push
-    # fires from it, even though the Open-Meteo fallback yields nothing.
-    service, sends = build_service(None, monkeypatch)  # Open-Meteo stub -> None
-    monkeypatch.setattr(
-        "modules.service_plugins.weather_service.fetch_precip_series_nws",
-        lambda *a, **k: make_series(**_INCOMING_HI),
-    )
-    asyncio.run(service._check_rain_nowcast())
-    assert len(sends) == 1
-    assert sends[0][1].startswith("🌧️ Heads up — Rain starting")
 
 
 def test_incoming_below_threshold_is_gated_and_left_unannounced(monkeypatch):

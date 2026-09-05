@@ -33,7 +33,7 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 
 - **Discord Bridge**: One-way webhook bridge to post mesh messages to Discord ([docs](docs/discord-bridge.md))
 - **Telegram Bridge**: One-way bridge to post mesh messages to Telegram ([docs](docs/telegram-bridge.md))
-- **Packet Capture**: Capture and publish packets to MQTT brokers ([docs](docs/packet-capture.md))
+- **Packet Capture**: Capture and publish packets to MQTT brokers, with optional zero-hop neighbor discovery — periodically records which repeaters the bot hears directly, with measured SNR, and feeds those confirmed links to the mesh graph. Off by default; a cycle spends airtime ([docs](docs/packet-capture.md))
 - **Map Uploader**: Upload node adverts to map.meshcore.dev ([docs](docs/map-uploader.md))
 - **Weather Service**: Scheduled forecasts, alerts, and lightning detection ([docs](docs/weather-service.md))
 - **Earthquake Service**: Scheduled USGS earthquake alerts for a configured region ([docs](docs/earthquake-service.md))
@@ -53,7 +53,7 @@ A Python bot that connects to MeshCore mesh networks via serial port, BLE, or TC
 
 1. Clone the repository:
 ```bash
-git clone <repository-url>
+git clone https://github.com/agessaman/meshcore-bot
 cd meshcore-bot
 ```
 
@@ -109,7 +109,7 @@ sudo ./install-service.sh
 
 2. Configure the bot:
 ```bash
-sudo nano /opt/meshcore-bot/config.ini
+sudo nano /etc/meshcore-bot/config.ini
 ```
 
 3. Start the service:
@@ -133,7 +133,9 @@ make deb
 sudo dpkg -i dist/meshcore-bot_*.deb
 ```
 
-The package installs the bot to `/opt/meshcore-bot/`, installs a systemd unit, and creates a `meshcore-bot` system user.
+The package installs root-owned code in `/opt/meshcore-bot/`, configuration in
+`/etc/meshcore-bot/`, mutable state in `/var/lib/meshcore-bot/`, logs in
+`/var/log/meshcore-bot/`, and creates a `meshcore-bot` system user.
 
 ### Docker Deployment
 For containerized deployment using Docker:
@@ -678,14 +680,15 @@ class MyCommand(BaseCommand):
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Submit a pull request against the dev branch
+Contributions are welcome. Fork the repository, create a feature branch, and open a pull request against the `dev` branch.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the checks CI runs, and project conventions.
+
+Please report security issues privately rather than in a public issue — see [SECURITY.md](SECURITY.md).
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for the full text.
 
 ## Acknowledgments
 
@@ -693,3 +696,5 @@ This project is licensed under the MIT License.
 - Some commands adapted from MeshingAround bot by K7MHI Kelly Keeton 2024
 - Packet capture service based on [meshcore-packet-capture](https://github.com/agessaman/meshcore-packet-capture) by agessaman
 - [meshcore-decoder](https://github.com/michaelhart/meshcore-decoder) by Michael Hart for client-side packet decoding and decryption in the web viewer
+
+The provenance of the `modules/solar_conditions.py` rewrite is recorded in [docs/solar-conditions-provenance.md](docs/solar-conditions-provenance.md).

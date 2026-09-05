@@ -625,16 +625,13 @@ class MessageHandler:
                 self.logger.warning("RAW_DATA event has no payload")
                 return
 
-            self.logger.info(f"📦 RAW_DATA EVENT RECEIVED: {payload}")
-            self.logger.info(f"📦 Event type: {type(event)}")
-            self.logger.info(f"📦 Metadata: {metadata}")
+            self.logger.debug(f"📦 RAW_DATA EVENT RECEIVED: {payload}")
+            self.logger.debug(f"📦 Metadata: {metadata}")
 
             # This should contain the full packet data we need
             if hasattr(payload, "data") or "data" in payload:
                 raw_data = payload.get("data", payload.data if hasattr(payload, "data") else None)
                 if raw_data:
-                    self.logger.info(f"🔍 FULL PACKET DATA: {raw_data}")
-
                     # Try to decode this as a MeshCore packet
                     if isinstance(raw_data, str):
                         # Convert to hex if it's not already
@@ -646,7 +643,7 @@ class MessageHandler:
                         # Decode the packet
                         packet_info = self.decode_meshcore_packet(raw_hex)
                         if packet_info:
-                            self.logger.info(f"✅ SUCCESSFULLY DECODED RAW PACKET: {packet_info}")
+                            self.logger.debug(f"✅ SUCCESSFULLY DECODED RAW PACKET: {packet_info}")
 
                             # Check if this is an advertisement packet and track it
                             await self._process_advertisement_packet(packet_info, metadata)
@@ -3494,9 +3491,7 @@ class MessageHandler:
                 self.logger.warning("NEW_CONTACT event has no payload data")
                 return
 
-            self.logger.info(f"🔍 NEW_CONTACT EVENT RECEIVED: {event}")
-            self.logger.info(f"📦 Event type: {type(event)}")
-            self.logger.info(f"📦 Event payload: {contact_data}")
+            self.logger.debug(f"🔍 NEW_CONTACT EVENT RECEIVED: {event}")
 
             # Get contact details
             contact_name = sanitize_name(contact_data.get("name", contact_data.get("adv_name", "Unknown")))
@@ -3605,10 +3600,16 @@ class MessageHandler:
             # Check if this is a repeater or companion
             if hasattr(self.bot, "repeater_manager"):
                 is_repeater = self.bot.repeater_manager._is_repeater_device(contact_data)
+                existing_tracking = self.bot.repeater_manager.get_tracked_contact_row(public_key)
+                already_on_device = self.bot.repeater_manager.is_contact_on_device(public_key)
+                known_contact = already_on_device or existing_tracking is not None
 
                 if is_repeater:
                     # REPEATER: Track directly in SQLite database (no device contact list)
-                    self.logger.info(f"📡 New repeater discovered: {contact_name} - tracking in database only")
+                    if known_contact:
+                        self.logger.info(f"📡 Known repeater advert: {contact_name} - tracking in database only")
+                    else:
+                        self.logger.info(f"📡 New repeater discovered: {contact_name} - tracking in database only")
 
                     # Track repeater in complete database with signal info
                     await self.bot.repeater_manager.track_contact_advertisement(
@@ -3639,12 +3640,19 @@ class MessageHandler:
                     return
                 else:
                     # COMPANION: track in DB; device add behaviour depends on auto_manage_contacts
-                    auto_manage_setting = self.bot.config.get("Bot", "auto_manage_contacts", fallback="false").lower()
-                    self.logger.info(
-                        "👤 New companion discovered: %s — auto_manage_contacts=%s",
-                        contact_name,
-                        auto_manage_setting,
-                    )
+                    auto_manage_setting = self.bot.config.get("Bot", "auto_manage_contacts", fallback="device").lower()
+                    if known_contact:
+                        self.logger.info(
+                            "👤 Known companion advert: %s — auto_manage_contacts=%s",
+                            contact_name,
+                            auto_manage_setting,
+                        )
+                    else:
+                        self.logger.info(
+                            "👤 New companion discovered: %s — auto_manage_contacts=%s",
+                            contact_name,
+                            auto_manage_setting,
+                        )
 
                     track_result = await self.bot.repeater_manager.track_contact_advertisement(
                         contact_data, signal_info, packet_hash=packet_hash
@@ -3669,7 +3677,7 @@ class MessageHandler:
                             await self.bot.repeater_manager.manage_contact_list(auto_cleanup=True)
                         else:
                             self.logger.info(
-                                "New companion %s — contact list has adequate space",
+                                "Companion %s — contact list has adequate space",
                                 contact_name,
                             )
                     elif auto_manage_setting == "bot":
@@ -3718,10 +3726,11 @@ class MessageHandler:
 
                     await self.bot.repeater_manager.check_and_auto_purge()
 
-                    self.bot.repeater_manager.log_purging_action(
-                        "new_contact_discovered",
-                        f"New contact discovered: {contact_name} (key: {public_key[:16]}...)",
-                    )
+                    if not known_contact:
+                        self.bot.repeater_manager.log_purging_action(
+                            "new_contact_discovered",
+                            f"New contact discovered: {contact_name} (key: {public_key[:16]}...)",
+                        )
                     return
 
             # Fallback: Track in database for unknown contact types (no repeater_manager)
@@ -3731,7 +3740,7 @@ class MessageHandler:
 
             # For unknown contact types, handle based on auto_manage_contacts setting
             if hasattr(self.bot, "repeater_manager"):
-                auto_manage_setting = self.bot.config.get("Bot", "auto_manage_contacts", fallback="false").lower()
+                auto_manage_setting = self.bot.config.get("Bot", "auto_manage_contacts", fallback="device").lower()
 
                 if auto_manage_setting == "device":
                     # Device mode: Let device handle auto-addition, bot manages capacity

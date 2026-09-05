@@ -10,9 +10,36 @@ import pytest
 from meshcore import EventType
 
 from modules.repeater_manager import (
+    REQUIRED_REPEATER_TABLES,
     RepeaterManager,
     collect_protected_pubkeys_for_device_mode,
+    validate_repeater_tables,
 )
+
+
+class TestValidateRepeaterTables:
+    """Callable without a RepeaterManager so lazy callers can still fail fast."""
+
+    def test_passes_on_a_migrated_database(self, test_db, mock_logger):
+        validate_repeater_tables(test_db, mock_logger)
+
+    def test_names_every_missing_table(self, test_db, mock_logger):
+        with test_db.connection() as conn:
+            conn.execute("DROP TABLE observed_paths")
+            conn.execute("DROP TABLE purging_log")
+            conn.commit()
+
+        with pytest.raises(RuntimeError) as excinfo:
+            validate_repeater_tables(test_db, mock_logger)
+
+        message = str(excinfo.value)
+        assert "observed_paths" in message
+        assert "purging_log" in message
+        assert "Run the bot once to apply migrations" in message
+
+    def test_covers_the_tables_the_manager_depends_on(self):
+        assert "mesh_connections" in REQUIRED_REPEATER_TABLES
+        assert "repeater_contacts" in REQUIRED_REPEATER_TABLES
 
 
 @pytest.fixture
@@ -346,7 +373,11 @@ class TestCleanupRepeaterRetention:
 
     def test_does_not_raise_when_db_raises(self, rm):
         from unittest.mock import patch as _patch
-        with _patch.object(rm.db_manager, "execute_update", side_effect=Exception("db error")):
+        with _patch.object(
+            rm.db_manager,
+            "delete_timestamp_rows_in_chunks",
+            side_effect=Exception("db error"),
+        ):
             rm.cleanup_repeater_retention()  # Should not raise
         rm.logger.error.assert_called()
 

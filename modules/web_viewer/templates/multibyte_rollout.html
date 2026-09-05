@@ -228,7 +228,7 @@
     </div><!-- /main-content -->
 </div><!-- /container-fluid -->
 
-<script>
+<script nonce="{{ g.csp_nonce }}">
 (function () {
     'use strict';
 
@@ -248,14 +248,14 @@
     };
 
     const STATUS_BADGE = {
-        multibyte_direct:  '<span class="badge" style="background:#198754;">Multibyte (Advert)</span>',
-        multibyte_relayed: '<span class="badge" style="background:#0dcaf0;color:#000;">Multibyte (Relay)</span>',
-        single_byte:       '<span class="badge" style="background:#ffc107;color:#000;">No MB</span>',
-        unknown:           '<span class="badge bg-secondary">Unknown</span>',
+        multibyte_direct:  { text: 'Multibyte (Advert)', classes: 'bg-success' },
+        multibyte_relayed: { text: 'Multibyte (Relay)', classes: 'bg-info text-dark' },
+        single_byte:       { text: 'No MB', classes: 'bg-warning text-dark' },
+        unknown:           { text: 'Unknown', classes: 'bg-secondary' },
     };
 
     const NODE_TYPE_LABELS = {
-        all:        { total: 'Total Relay Nodes',  sub: 'Repeaters &amp; Room Servers' },
+        all:        { total: 'Total Relay Nodes',  sub: 'Repeaters & Room Servers' },
         repeater:   { total: 'Total Repeaters',    sub: 'Repeater role only' },
         roomserver: { total: 'Total Room Servers', sub: 'Room Server role only' },
     };
@@ -292,12 +292,24 @@
         } catch { return String(ts); }
     }
 
-    function bphLabel(v) {
-        if (v === null || v === undefined) return '<span class="text-muted small">—</span>';
-        if (v === 1) return '<span class="text-warning small">1-byte</span>';
-        if (v === 2) return '<span class="text-success small">2-byte</span>';
-        if (v === 3) return '<span class="text-success small">3-byte</span>';
-        return esc(String(v));
+    function bphText(v) {
+        if (v === null || v === undefined) return '—';
+        if (v >= 1 && v <= 3) return `${v}-byte`;
+        return String(v);
+    }
+
+    function makeCell(value, classes = '') {
+        const cell = document.createElement('td');
+        cell.className = classes;
+        cell.textContent = String(value ?? '');
+        return cell;
+    }
+
+    function makeBadge(value, classes) {
+        const badge = document.createElement('span');
+        badge.className = `badge ${classes}`;
+        badge.textContent = String(value ?? '');
+        return badge;
     }
 
     function isDark() {
@@ -497,46 +509,50 @@
         document.getElementById('priority-count').textContent = list.length;
 
         if (list.length === 0) {
-            tbody.innerHTML = '';
+            tbody.replaceChildren();
             empty.style.display = 'block';
             return;
         }
         empty.style.display = 'none';
 
-        tbody.innerHTML = list.map((r, i) => {
+        tbody.replaceChildren();
+        list.forEach((r, i) => {
             const peers = r.prefix_peers || [];
-            let relayCell;
+            const row = document.createElement('tr');
+            row.append(
+                makeCell(i + 1, 'text-muted'),
+                makeCell(r.name, 'fw-semibold'),
+            );
+            const roleCell = document.createElement('td');
+            roleCell.appendChild(makeBadge(r.role, 'bg-secondary'));
+            row.appendChild(roleCell);
+            const relayCell = makeCell((r.relay_score || 0).toLocaleString(), 'text-end');
             if (peers.length > 0) {
                 const mbPeers  = peers.filter(p => p.status === 'multibyte_direct' || p.status === 'multibyte_relayed');
                 const sbPeers  = peers.filter(p => p.status === 'single_byte');
                 const parts = [];
-                if (mbPeers.length)  parts.push('Confirmed multibyte: ' + mbPeers.map(p => esc(p.name)).join(', '));
-                if (sbPeers.length)  parts.push('Also unconfirmed: '    + sbPeers.map(p => esc(p.name)).join(', '));
+                if (mbPeers.length)  parts.push('Confirmed multibyte: ' + mbPeers.map(p => String(p.name ?? '')).join(', '));
+                if (sbPeers.length)  parts.push('Also unconfirmed: '    + sbPeers.map(p => String(p.name ?? '')).join(', '));
                 const tipText = 'Shared 1-byte prefix — score may overlap with: ' + parts.join(' · ');
-                const iconColor = mbPeers.length ? '#0dcaf0' : '#adb5bd';
-                relayCell = `${(r.relay_score || 0).toLocaleString()} <span
-                       style="cursor:default; color:${iconColor};"
-                       data-bs-toggle="tooltip"
-                       data-bs-placement="top"
-                       title="${tipText}"
-                   >ⓘ</span>`;
-            } else {
-                relayCell = (r.relay_score || 0).toLocaleString();
+                const info = document.createElement('span');
+                info.className = mbPeers.length ? 'text-info' : 'text-secondary';
+                info.style.cursor = 'default';
+                info.dataset.bsToggle = 'tooltip';
+                info.dataset.bsPlacement = 'top';
+                info.title = tipText;
+                info.textContent = ' ⓘ';
+                relayCell.appendChild(info);
             }
-
-            return `
-            <tr>
-                <td class="text-muted">${i + 1}</td>
-                <td class="fw-semibold">${esc(r.name)}</td>
-                <td><span class="badge bg-secondary">${esc(r.role)}</span></td>
-                <td class="text-end">${relayCell}</td>
-                <td class="text-end">${(r.unique_sources || 0).toLocaleString()}</td>
-                <td class="text-end">${(r.unique_dests || 0).toLocaleString()}</td>
-                <td class="text-end">${(r.legacy_degree || 0).toLocaleString()}</td>
-                <td>${fmtDate(r.last_seen)}</td>
-                <td>${r.location ? esc(r.location) : '<span class="text-muted">—</span>'}</td>
-            </tr>`;
-        }).join('');
+            row.append(
+                relayCell,
+                makeCell((r.unique_sources || 0).toLocaleString(), 'text-end'),
+                makeCell((r.unique_dests || 0).toLocaleString(), 'text-end'),
+                makeCell((r.legacy_degree || 0).toLocaleString(), 'text-end'),
+                makeCell(fmtDate(r.last_seen)),
+                makeCell(r.location || '—', r.location ? '' : 'text-muted'),
+            );
+            tbody.appendChild(row);
+        });
 
         /* activate Bootstrap tooltips on new elements */
         tbody.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el => {
@@ -580,7 +596,7 @@
         const count = document.getElementById('all-count');
 
         if (rows.length === 0) {
-            tbody.innerHTML = '';
+            tbody.replaceChildren();
             empty.style.display = 'block';
             count.textContent = '';
             return;
@@ -588,17 +604,25 @@
         empty.style.display = 'none';
         count.textContent = `Showing ${rows.length.toLocaleString()} of ${allRepeaters.length.toLocaleString()} relay nodes`;
 
-        tbody.innerHTML = rows.map(r => `
-            <tr>
-                <td>${esc(r.name)}</td>
-                <td><span class="badge bg-secondary">${esc(r.role)}</span></td>
-                <td>${STATUS_BADGE[r.status] || ''}</td>
-                <td>${bphLabel(r.out_bytes_per_hop)}</td>
-                <td>${(r.advert_count || 0).toLocaleString()}</td>
-                <td>${fmtDate(r.last_seen)}</td>
-                <td>${r.location ? esc(r.location) : '<span class="text-muted">—</span>'}</td>
-            </tr>
-        `).join('');
+        tbody.replaceChildren();
+        rows.forEach(r => {
+            const row = document.createElement('tr');
+            row.appendChild(makeCell(r.name));
+            const role = document.createElement('td');
+            role.appendChild(makeBadge(r.role, 'bg-secondary'));
+            row.appendChild(role);
+            const statusCell = document.createElement('td');
+            const status = STATUS_BADGE[r.status] || STATUS_BADGE.unknown;
+            statusCell.appendChild(makeBadge(status.text, status.classes));
+            row.append(
+                statusCell,
+                makeCell(bphText(r.out_bytes_per_hop)),
+                makeCell((r.advert_count || 0).toLocaleString()),
+                makeCell(fmtDate(r.last_seen)),
+                makeCell(r.location || '—', r.location ? '' : 'text-muted'),
+            );
+            tbody.appendChild(row);
+        });
     }
 
     /* ── main render ─────────────────────────────────────────────────── */
@@ -610,7 +634,7 @@
         /* KPI labels for node_type */
         const lbl = NODE_TYPE_LABELS[data.node_type] || NODE_TYPE_LABELS.all;
         document.getElementById('kpi-total-label').textContent = lbl.total;
-        document.getElementById('kpi-total-sub').innerHTML    = lbl.sub;
+        document.getElementById('kpi-total-sub').textContent = lbl.sub;
 
         /* KPI values */
         const mbTotal   = s.multibyte_direct + s.multibyte_relayed;

@@ -8,6 +8,7 @@ import asyncio
 import json
 import math
 import re
+import threading
 import time
 import xml.dom.minidom
 from datetime import datetime, timedelta, timezone
@@ -37,10 +38,12 @@ from ..commands.rain_command import (
     fetch_precip_series,
     fetch_precip_series_nws,
     format_amount_estimate,
+    join_location,
+    nws_http_means_no_coverage,
     precip_descriptor,
 )
-from ..location_format import join_location, reverse_geocode_region
-from ..url_shortener import shorten_url
+from ..location_format import reverse_geocode_region
+from ..url_shortener import shorten_url_sync
 from ..utils import get_config_timezone
 from .base_service import BaseServicePlugin
 
@@ -94,6 +97,36 @@ class WeatherService(BaseServicePlugin):
     config_section = 'Weather_Service'
     description = "Scheduled weather forecasts and alert monitoring"
 
+    # Web-viewer settings schema (see modules/settings_schema.py)
+    settings_schema = [
+        {"key": "weather_alarm", "label": "Daily forecast time", "type": "str", "default": "6:00",
+         "help": "HH:MM (24h), or 'sunrise'/'sunset'."},
+        {"key": "weather_channel", "label": "Forecast channel", "type": "str", "default": "#weather",
+         "help": "Channel for daily forecasts."},
+        {"key": "alerts_channel", "label": "Alerts channel", "type": "str", "default": "#weather",
+         "help": "Channel for weather alerts."},
+        {"key": "my_position_lat", "label": "Latitude", "type": "float", "min": -90, "max": 90, "default": "",
+         "help": "Bot latitude (decimal degrees) for forecasts/alerts."},
+        {"key": "my_position_lon", "label": "Longitude", "type": "float", "min": -180, "max": 180, "default": "",
+         "help": "Bot longitude (decimal degrees)."},
+        {"key": "poll_weather_alerts_interval", "label": "Alert poll interval", "type": "int",
+         "min": 1000, "default": 600000, "unit": "ms", "help": "How often to check for new alerts."},
+        {"key": "rain_nowcast_enabled", "label": "Rain nowcast", "type": "bool", "default": False,
+         "help": "Push a heads-up when rain is about to start at the bot's position."},
+        {"key": "rain_channel", "label": "Rain nowcast channel", "type": "str", "default": "",
+         "help": "Channel for rain heads-ups. Defaults to the forecast channel."},
+        {"key": "poll_rain_nowcast_interval", "label": "Rain poll interval", "type": "int",
+         "min": 1000, "default": 900000, "unit": "ms", "help": "How often to check for incoming rain."},
+        {"key": "rain_nowcast_lead_minutes", "label": "Rain lead time", "type": "int", "min": 1, "default": 60, "unit": "min",
+         "help": "Only announce rain starting within this many minutes."},
+        {"key": "rain_nowcast_renotify_minutes", "label": "Rain renotify", "type": "int", "min": 1, "default": 30, "unit": "min",
+         "help": "Minimum minutes between rain pushes."},
+        {"key": "blitz_collection_interval", "label": "Storm collection interval", "type": "int",
+         "min": 1000, "default": 600000, "unit": "ms", "help": "How often thunder/storm data is aggregated."},
+        {"key": "flood_scope", "label": "Flood scope", "type": "str", "default": "",
+         "help": "Optional regional TC_FLOOD scope for mesh posts (e.g. #west)."},
+    ]
+
     def __init__(self, bot: Any):
         """Initialize weather service.
 
@@ -138,6 +171,10 @@ class WeatherService(BaseServicePlugin):
 
         # Create retry-enabled session for API calls
         self.api_session = self._create_retry_session()
+        # requests.Session mutates shared cookie/adapter state and is not safe to
+        # use concurrently. Keep all of this service's threaded session work
+        # serialized without making the event loop wait on a threading lock.
+        self._api_session_lock = threading.Lock()
 
         # Get temperature/wind units from config (for Open-Meteo)
         self.temperature_unit = self.bot.config.get('Weather', 'temperature_unit', fallback='fahrenheit')
@@ -186,6 +223,9 @@ class WeatherService(BaseServicePlugin):
         # Adjacent county names (set) so multi-county alerts name the NEARBY affected
         # counties and collapse far ones. Resolved lazily (config or Census file).
         self._alert_neighbors: Optional[set] = None
+
+        # Lazy: None = unknown, False = NOAA alerts unavailable (non-US / no coverage)
+        self._nws_alerts_available: Optional[bool] = None
 
         # Background tasks
         self._alerts_task: Optional[asyncio.Task] = None
@@ -278,6 +318,30 @@ class WeatherService(BaseServicePlugin):
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         return session
+
+    def _run_api_session_call(self, callback: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run one complete synchronous session operation under the session lock."""
+        with self._api_session_lock:
+            return callback(*args, **kwargs)
+
+    def _get_api_json(
+        self,
+        url: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        timeout: float,
+    ) -> tuple[requests.Response, Any]:
+        """Fetch and decode JSON as one serialized worker-thread operation."""
+        with self._api_session_lock:
+            response = self.api_session.get(url, params=params, timeout=timeout)
+            data = response.json() if response.ok else None
+            return response, data
+
+    def _get_api_text(self, url: str, *, timeout: float) -> tuple[requests.Response, str]:
+        """Fetch and decode text as one serialized worker-thread operation."""
+        with self._api_session_lock:
+            response = self.api_session.get(url, timeout=timeout)
+            return response, response.text if response.ok else ""
 
     def _get_sunrise_sunset_time(self, event: str) -> Optional[datetime]:
         """Get sunrise or sunset time for configured position.
@@ -583,15 +647,18 @@ class WeatherService(BaseServicePlugin):
                 params['models'] = self.weather_model
 
             try:
-                response = self.api_session.get(api_url, params=params, timeout=10)
+                response, data = await asyncio.to_thread(
+                    self._get_api_json,
+                    api_url,
+                    params=params,
+                    timeout=10,
+                )
                 if not response.ok:
                     self.logger.warning(f"Error fetching weather from Open-Meteo: HTTP {response.status_code}")
                     return "Error fetching weather data"
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                 self.logger.warning(f"Timeout/connection error fetching weather: {e}")
                 return "Error fetching weather data"
-
-            data = response.json()
 
             # Extract current conditions
             current = data.get('current', {})
@@ -900,6 +967,9 @@ class WeatherService(BaseServicePlugin):
             time_window_start = (current_check_time - self.poll_weather_alerts_interval
                                  if first_check else self.last_alert_check_time)
 
+            if self._nws_alerts_available is False:
+                return
+
             # Round coordinates
             lat_rounded = round(self.my_position_lat, 4)
             lon_rounded = round(self.my_position_lon, 4)
@@ -915,17 +985,31 @@ class WeatherService(BaseServicePlugin):
                 alert_url = f"https://api.weather.gov/alerts/active.atom?point={lat_rounded},{lon_rounded}"
 
             try:
-                alert_data = self.api_session.get(alert_url, timeout=10)
+                alert_data, alert_text = await asyncio.to_thread(
+                    self._get_api_text,
+                    alert_url,
+                    timeout=10,
+                )
                 if not alert_data.ok:
-                    self.logger.debug(f"Error fetching alerts: HTTP {alert_data.status_code}")
+                    if nws_http_means_no_coverage(alert_data.status_code):
+                        self._nws_alerts_available = False
+                        self.logger.warning(
+                            "NWS weather alerts unavailable (HTTP %s); NOAA alerts are US-only — "
+                            "skipping future alert polls",
+                            alert_data.status_code,
+                        )
+                    else:
+                        self.logger.debug(f"Error fetching alerts: HTTP {alert_data.status_code}")
                     return
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
                 self.logger.debug(f"Timeout/connection error fetching alerts: {e}")
                 return
 
+            self._nws_alerts_available = True
+
             # Parse ATOM feed with full metadata extraction (same as wx_command)
             alerts = []
-            alertxml = xml.dom.minidom.parseString(alert_data.text)
+            alertxml = await asyncio.to_thread(xml.dom.minidom.parseString, alert_text)
 
             for entry in alertxml.getElementsByTagName("entry"):
                 try:
@@ -1027,34 +1111,32 @@ class WeatherService(BaseServicePlugin):
     async def _check_rain_nowcast(self) -> None:
         """Fetch the precip nowcast for the bot's position and push if rain is incoming."""
         try:
-            loop = asyncio.get_event_loop()
-            # Prefer the NWS gridpoint (forecaster QPF+PoP — it captures the
-            # convection the Open-Meteo model smooths away); fall back to
-            # Open-Meteo when NWS has no coverage (non-US) or the fetch fails.
-            series = await loop.run_in_executor(
-                None,
-                lambda: fetch_precip_series_nws(
+            # Prefer the NWS gridpoint (forecaster-adjusted QPF + PoP — it captures
+            # the convection the Open-Meteo model smooths away, which is why this
+            # push could stay silent during real rain). Fall back to Open-Meteo when
+            # NWS has no coverage (non-US) or the request fails.
+            series = await asyncio.to_thread(
+                self._run_api_session_call,
+                fetch_precip_series_nws,
+                self.api_session,
+                self.my_position_lat,
+                self.my_position_lon,
+                timeout=10,
+                logger=self.logger,
+                cache_ttl=self.rain_nowcast_cache_seconds,
+                pop_floor=self.rain_nowcast_min_probability,
+            )
+            if not series:
+                series = await asyncio.to_thread(
+                    self._run_api_session_call,
+                    fetch_precip_series,
                     self.api_session,
                     self.my_position_lat,
                     self.my_position_lon,
+                    weather_model=self.weather_model or "",
                     timeout=10,
                     logger=self.logger,
                     cache_ttl=self.rain_nowcast_cache_seconds,
-                    pop_floor=self.rain_nowcast_min_probability,
-                ),
-            )
-            if not series:
-                series = await loop.run_in_executor(
-                    None,
-                    lambda: fetch_precip_series(
-                        self.api_session,
-                        self.my_position_lat,
-                        self.my_position_lon,
-                        weather_model=self.weather_model or "",
-                        timeout=10,
-                        logger=self.logger,
-                        cache_ttl=self.rain_nowcast_cache_seconds,
-                    ),
                 )
             if not series:
                 return
@@ -1400,7 +1482,12 @@ class WeatherService(BaseServicePlugin):
         try:
             # Use reverse geocoding if available in utils
             from ..utils import rate_limited_nominatim_reverse_sync
-            location = rate_limited_nominatim_reverse_sync(self.bot, f"{lat}, {lon}", timeout=5)
+            location = await asyncio.to_thread(
+                rate_limited_nominatim_reverse_sync,
+                self.bot,
+                f"{lat}, {lon}",
+                timeout=5,
+            )
             if location:
                 # Extract city/town name
                 if isinstance(location, dict):
@@ -2168,10 +2255,11 @@ class WeatherService(BaseServicePlugin):
 
     async def _shorten_url(self, url: str) -> str:
         """Shorten URL using [External_Data] short_url_website (default v.gd)."""
-        return await shorten_url(
+        return await asyncio.to_thread(
+            self._run_api_session_call,
+            shorten_url_sync,
             url,
             config=self.bot.config,
             session=self.api_session,
             logger=self.logger,
         )
-

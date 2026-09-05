@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Import meshcore
@@ -19,6 +19,23 @@ from meshcore import EventType
 
 # Import bot's enums
 from ..enums import PayloadType, PayloadVersion, RouteType
+from ..meshcore_payload_decode import (
+    DEFAULT_PUBLIC_CHANNEL_KEY,
+    ChannelKeyStore,
+    decode_payload,
+)
+from ..neighbors_discovery import (
+    MAX_INTERVAL_HOURS,
+    MIN_CYCLE_GAP_SECONDS,
+    MIN_INTERVAL_HOURS,
+    STATUS_RESPONDED,
+    NeighborsConfig,
+    build_neighbors_message,
+    collect_scopes,
+    discover_neighbors,
+    fetch_self_scopes,
+    record_neighbors,
+)
 
 # Import bot's utilities for packet hash
 from ..utils import (
@@ -27,7 +44,7 @@ from ..utils import (
     parse_trace_payload_route_hashes,
     verify_meshcore_advert_ed25519,
 )
-from ..version_info import resolve_runtime_version
+from ..version_info import resolve_application_version
 
 # Import MQTT client
 try:
@@ -42,6 +59,101 @@ import contextlib
 from .base_service import BaseServicePlugin
 from .packet_capture_utils import create_auth_token_async, read_private_key_file
 
+# bot_metadata key holding the last neighbors cycle timestamp. Namespaced because
+# bot_metadata is shared across the whole bot.
+NEIGHBORS_STATE_KEY = "packet_capture.last_neighbors_publish"
+
+# A cycle can spend airtime without producing a publish timestamp (for example,
+# when the discover acknowledgement is lost). Persist that attempt separately so
+# a process restart cannot bypass the short airtime guard while still allowing
+# the scheduler to retry after MIN_CYCLE_GAP_SECONDS rather than waiting a full
+# configured interval.
+NEIGHBORS_ATTEMPT_STATE_KEY = "packet_capture.last_neighbors_attempt"
+
+# How long the scheduler waits before re-checking after a cycle that produced no
+# result. Short on purpose: the usual causes (radio down, unsupported build) cost
+# nothing to re-test. A cycle that did transmit is held by MIN_CYCLE_GAP_SECONDS
+# instead, which is longer.
+NEIGHBORS_RETRY_BACKOFF_SECONDS = 300.0
+
+# Sentinel meaning "no IATA configured" (documented as invalid in config.ini.example).
+DEFAULT_IATA = "XYZ"
+
+
+def _decode_key_str(key_str: str) -> Optional[bytes]:
+    """Decode a 16-byte channel key from a hex (32 chars) or base64 string."""
+    key_str = key_str.strip()
+    try:
+        if len(key_str) == 32 and all(c in "0123456789abcdefABCDEF" for c in key_str):
+            return bytes.fromhex(key_str)
+        import base64
+
+        raw = base64.b64decode(key_str, validate=True)
+        return raw if len(raw) == 16 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_size(value: str) -> int:
+    """Parse a size string like '50MB', '10M', or '1048576' into bytes."""
+    value = str(value).strip().upper().replace("B", "")
+    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    try:
+        if value and value[-1] in multipliers:
+            return int(float(value[:-1]) * multipliers[value[-1]])
+        return int(value or 0)
+    except ValueError:
+        return 0
+
+
+class _RotatingPacketLog:
+    """Writes one JSON line per packet, with optional size/time rotation.
+
+    ``rotation='off'`` appends to a single file (original behavior). ``'size'``
+    and ``'time'`` use stdlib rotating handlers. Kept host-agnostic so the same
+    logic can be ported to meshcore-packet-capture.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        rotation: str = "off",
+        max_bytes: int = 0,
+        backup_count: int = 5,
+        when: str = "midnight",
+    ) -> None:
+        self._handler = None
+        self._fh = None
+        if rotation == "size" and max_bytes > 0:
+            from logging.handlers import RotatingFileHandler
+
+            self._handler = RotatingFileHandler(
+                path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+            )
+        elif rotation == "time":
+            from logging.handlers import TimedRotatingFileHandler
+
+            self._handler = TimedRotatingFileHandler(
+                path, when=when, backupCount=backup_count, encoding="utf-8"
+            )
+        else:
+            self._fh = open(path, "a", encoding="utf-8")
+
+    def write_line(self, line: str) -> None:
+        if self._handler is not None:
+            # Default logging formatter emits just the message plus a terminator.
+            record = logging.LogRecord("packetlog", logging.INFO, "(packet)", 0, line, None, None)
+            self._handler.emit(record)
+        else:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        if self._handler is not None:
+            self._handler.close()
+        elif self._fh is not None:
+            self._fh.close()
+
 
 class PacketCaptureService(BaseServicePlugin):
     """Packet capture service using bot's meshcore connection.
@@ -52,6 +164,134 @@ class PacketCaptureService(BaseServicePlugin):
 
     config_section = "PacketCapture"  # Explicit config section
     description = "Captures packets from MeshCore network and publishes to MQTT"
+
+    # Web-viewer settings schema (see modules/settings_schema.py). Core settings
+    # are typed here; the detailed mqtt1_*/mqtt2_* broker keys remain editable
+    # via the raw "Other config values" editor.
+    settings_schema = [
+        {"key": "output_file", "label": "Output file", "type": "str", "default": "", "width": "lg",
+         "help": "Optional file to also write captured packets to."},
+        {"key": "owner_public_key", "label": "Owner public key", "type": "str", "default": "", "width": "lg",
+         "help": "Owner identity included with uploads."},
+        {"key": "owner_email", "label": "Owner email", "type": "str", "default": "",
+         "help": "Owner contact email included with uploads."},
+        {"key": "private_key_path", "label": "Private key path", "type": "str", "default": "", "width": "lg",
+         "help": "Path to the device private key used to sign uploads."},
+        {"key": "iata", "label": "IATA code", "type": "str", "default": "",
+         "help": "Nearest airport IATA code for location tagging."},
+        {"key": "verbose", "label": "Verbose logging", "type": "bool", "default": False, "help": "Detailed logging."},
+        {"key": "debug", "label": "Debug logging", "type": "bool", "default": False, "help": "Debug-level logging."},
+        {"key": "mqtt_enabled", "label": "MQTT publishing", "type": "bool", "default": True,
+         "help": "Master switch for publishing captured packets to the MQTT brokers below."},
+        # --- Advanced (collapsed by default in the UI) ---
+        {"key": "auth_token_method", "label": "Auth token method", "type": "enum", "group": "Advanced",
+         "options": [{"value": "device", "label": "Device (on-device signing, default)"},
+                     {"value": "python", "label": "Python (requires private key)"}],
+         "default": "device", "help": "How JWT auth tokens are signed."},
+        {"key": "mqtt_skip_unparseable_packets", "label": "Skip unparseable packets", "type": "bool",
+         "group": "Advanced", "default": True, "help": "Don't publish packets that fail to parse (hash 0000…)."},
+        {"key": "advert_require_valid_signature", "label": "Require valid advert signature", "type": "bool",
+         "group": "Advanced", "default": False, "help": "Only publish ADVERT packets with a valid signature."},
+        {"key": "raw_duplicate_window", "label": "Duplicate window", "type": "float", "group": "Advanced",
+         "min": 0, "default": 2.0, "unit": "s", "help": "De-duplicate identical raw packets within this window."},
+        {"key": "rf_data_cache_timeout", "label": "RF data cache timeout", "type": "float", "group": "Advanced",
+         "min": 0, "default": 15.0, "unit": "s", "help": "How long RF metadata is cached for correlation."},
+        {"key": "stats_in_status_enabled", "label": "Stats in status", "type": "bool", "group": "Advanced",
+         "default": True, "help": "Include capture statistics in the MQTT status payload."},
+        {"key": "stats_refresh_interval", "label": "Stats refresh interval", "type": "int", "group": "Advanced",
+         "min": 0, "default": 300, "unit": "s", "help": "How often stats are refreshed. 0 disables."},
+        {"key": "health_check_interval", "label": "Health check interval", "type": "int", "group": "Advanced",
+         "min": 0, "default": 30, "unit": "s", "help": "Radio health-check cadence. 0 disables."},
+        {"key": "health_check_grace_period", "label": "Health check grace period", "type": "int", "group": "Advanced",
+         "min": 0, "default": 2, "help": "Consecutive failures tolerated before acting."},
+        {"key": "jwt_renewal_interval", "label": "JWT renewal interval", "type": "int", "group": "Advanced",
+         "min": 1, "default": 43200, "unit": "s", "help": "Default JWT renewal interval (per-broker overrides apply)."},
+        {"key": "jwt_ttl_seconds", "label": "JWT TTL", "type": "int", "group": "Advanced",
+         "min": 1, "default": 86400, "unit": "s", "help": "Default JWT lifetime (per-broker overrides apply)."},
+        # --- Neighbors (zero-hop discovery; see modules/neighbors_discovery.py) ---
+        {"key": "neighbors_enabled", "label": "Neighbors discovery", "type": "bool", "group": "Neighbors",
+         "default": False,
+         "help": "Periodically ask which repeaters this node hears directly. Records confirmed "
+                 "direct links with SNR, and publishes to brokers that opted in."},
+        {"key": "neighbors_interval_hours", "label": "Interval", "type": "int", "group": "Neighbors",
+         "min": 12, "max": 336, "default": 24, "unit": "h",
+         "help": "How often a discovery cycle runs. Clamped to 12-336h, matching the firmware."},
+        {"key": "neighbors_discover_window", "label": "Discover window", "type": "float", "group": "Neighbors",
+         "min": 5, "default": 60.0, "unit": "s",
+         "help": "How long responses are collected. Repeaters reply after a random delay, so a "
+                 "short window finds fewer neighbours. The bot stays responsive throughout."},
+        {"key": "neighbors_max", "label": "Max neighbours", "type": "int", "group": "Neighbors",
+         "min": 1, "default": 32, "help": "Cap per cycle, most useful first (recent, then stronger SNR)."},
+        {"key": "neighbors_feed_mesh_graph", "label": "Feed mesh graph", "type": "bool", "group": "Neighbors",
+         "default": True, "help": "Also add confirmed direct links as mesh graph edges."},
+        {"key": "neighbors_collect_scopes", "label": "Collect region scopes", "type": "bool",
+         "group": "Neighbors", "default": False,
+         "help": "SLOW — also ask each neighbour for its region scopes. Each request holds the radio "
+                 "for up to ~25s, delaying bot replies, and for a repeater with no stored path the "
+                 "library temporarily rewrites that contact's path on the device. Leave off unless "
+                 "you specifically need scopes."},
+        {"key": "neighbors_command_timeout", "label": "Command timeout", "type": "float",
+         "group": "Neighbors", "min": 1, "default": 20.0, "unit": "s",
+         "help": "Cap on the discover request itself; a stalled link can otherwise block."},
+        {"key": "neighbors_scope_timeout", "label": "Scope timeout", "type": "float", "group": "Neighbors",
+         "min": 0, "default": 0.0, "unit": "s",
+         "help": "Per-scope-request wait. 0 uses the device's own airtime estimate."},
+        {"key": "neighbors_scope_min_timeout", "label": "Scope min timeout", "type": "float",
+         "group": "Neighbors", "min": 0, "default": 8.0, "unit": "s",
+         "help": "Floor under the device-suggested scope timeout."},
+        {"key": "neighbors_scope_gap", "label": "Scope gap", "type": "float", "group": "Neighbors",
+         "min": 0, "default": 2.0, "unit": "s", "help": "Settle delay between scope requests."},
+        {"key": "neighbors_cycle_timeout", "label": "Scope pass budget", "type": "float",
+         "group": "Neighbors", "min": 10, "default": 600.0, "unit": "s",
+         "help": "Overall budget for the scope pass; unreached neighbours report as timeout."},
+        {"key": "neighbors_self_scopes", "label": "Own scopes override", "type": "str",
+         "group": "Neighbors", "default": "", "width": "lg",
+         "help": "Override for this node's own \"self.scopes\" value. Empty asks the device."},
+    ]
+
+    # Repeating structured blocks (see modules/settings_schema.py). Each MQTT
+    # broker is mqtt<N>_* and must stay contiguously numbered — the editor
+    # renumbers them on save.
+    settings_repeating_blocks = [
+        {
+            "id": "mqtt",
+            "label": "MQTT brokers",
+            "item_label": "MQTT broker",
+            "enabled_field": "enabled",
+            "help": "Each broker captured packets are published to. Brokers are tried in order.",
+            "fields": [
+                {"key": "server", "label": "Server", "type": "str", "default": "",
+                 "help": "Broker hostname or IP."},
+                {"key": "port", "label": "Port", "type": "int", "min": 1, "max": 65535, "default": 1883,
+                 "help": "Broker port (1883 plain, 8883/443 for TLS/websockets)."},
+                {"key": "transport", "label": "Transport", "type": "enum",
+                 "options": [{"value": "tcp", "label": "TCP"}, {"value": "websockets", "label": "WebSockets"}],
+                 "default": "tcp"},
+                {"key": "use_tls", "label": "Use TLS", "type": "bool", "default": False},
+                {"key": "tls_insecure", "label": "Skip TLS verification", "type": "bool", "default": False,
+                 "help": "INSECURE — accept any broker certificate. Only for self-signed brokers on a "
+                         "trusted network; leave off so certificate and hostname are verified."},
+                {"key": "use_auth_token", "label": "Use JWT auth token", "type": "bool", "default": False,
+                 "help": "Authenticate with a signed JWT instead of username/password."},
+                {"key": "token_audience", "label": "Token audience", "type": "str", "default": "",
+                 "help": "JWT audience claim (when using auth token)."},
+                {"key": "topic_status", "label": "Status topic", "type": "str", "default": ""},
+                {"key": "topic_packets", "label": "Packets topic", "type": "str", "default": ""},
+                {"key": "neighbors", "label": "Publish neighbours", "type": "bool", "default": True,
+                 "help": "Send the zero-hop neighbours snapshot to this broker. On by default, but "
+                         "nothing is sent until Neighbours discovery is enabled above. Turn off to "
+                         "hold just this broker back."},
+                {"key": "topic_neighbors", "label": "Neighbours topic", "type": "str", "default": "",
+                 "help": "Defaults to the packets topic with its last segment swapped for "
+                         "'neighbors', else <topic prefix>/neighbors."},
+                {"key": "websocket_path", "label": "WebSocket path", "type": "str", "default": "/mqtt",
+                 "help": "Path when transport is websockets."},
+                {"key": "client_id", "label": "Client ID", "type": "str", "default": ""},
+                {"key": "upload_packet_types", "label": "Upload packet types", "type": "str", "default": "",
+                 "help": "Comma-separated type numbers (e.g. 2,4). Empty = upload all."},
+            ],
+        }
+    ]
 
     def __init__(self, bot):
         """Initialize packet capture service.
@@ -143,6 +383,24 @@ class PacketCaptureService(BaseServicePlugin):
         self.cached_firmware_info = None
         self.radio_info = None
 
+        # Neighbors discovery runtime state. Kept out of _load_config so a future
+        # config reload cannot orphan a running scheduler or replay a cycle
+        # (map_uploader_service re-invokes its own _load_config on reload).
+        self.neighbors_task = None
+        self.neighbors_capability_state = None
+        self.neighbors_discover_failures = 0
+        self.neighbors_topic_warned: set[int] = set()
+        self.last_neighbors_publish = self._load_neighbors_state()
+        # When a cycle last reached the radio, whether or not it produced a
+        # result. Callers that ration airtime need this rather than
+        # last_neighbors_publish, which a failed cycle never stamps.
+        self.last_neighbors_attempt = self._load_neighbors_attempt_state()
+        # Single-flight across every trigger (scheduler, command, future callers):
+        # two overlapping cycles would collect into each other's discover window
+        # and double the airtime. asyncio is single-threaded, so a plain flag set
+        # and cleared without an await in between is enough.
+        self.neighbors_cycle_active = False
+
         # Background tasks
         self.background_tasks: list[asyncio.Task] = []
         self.should_exit = False
@@ -186,12 +444,29 @@ class PacketCaptureService(BaseServicePlugin):
         self.debug = config.getboolean("PacketCapture", "debug", fallback=False)
         self._apply_log_level()
 
+        # Packet log rotation (off|size|time). Default off preserves single-file behavior.
+        self.log_rotation = config.get("PacketCapture", "log_rotation", fallback="off").strip().lower()
+        self.log_max_bytes = _parse_size(config.get("PacketCapture", "log_max_bytes", fallback="0"))
+        self.log_backup_count = config.getint("PacketCapture", "log_backup_count", fallback=5)
+        self.log_rotation_when = config.get("PacketCapture", "log_rotation_when", fallback="midnight").strip()
+
+        # Payload decoding (decode plain text / structured payload into a nested "decoded" object)
+        self.decode_payloads = config.getboolean("PacketCapture", "decode_payloads", fallback=False)
+        # Global default for the per-broker mqttN_include_decoded toggle (default off:
+        # opt in per broker, or set include_decoded = true to publish decoded everywhere)
+        self.include_decoded = config.getboolean("PacketCapture", "include_decoded", fallback=False)
+        self.channel_key_store = self._build_channel_key_store(config) if self.decode_payloads else None
+
         # MQTT configuration
         self.mqtt_enabled = config.getboolean("PacketCapture", "mqtt_enabled", fallback=True)
         self.mqtt_brokers = self._parse_mqtt_brokers(config)
 
-        # Global IATA
-        self.global_iata = config.get("PacketCapture", "iata", fallback="XYZ").lower()
+        # Global IATA. Blank stays blank so packet/status {IATA} topics keep
+        # their historical empty-segment resolution; a missing key still falls
+        # back to the XYZ sentinel. Neighbors treats blank and XYZ as unset.
+        self.global_iata = config.get(
+            "PacketCapture", "iata", fallback=DEFAULT_IATA
+        ).strip().lower()
 
         # Owner information
         self.owner_public_key = config.get("PacketCapture", "owner_public_key", fallback=None)
@@ -227,6 +502,154 @@ class PacketCaptureService(BaseServicePlugin):
         # Note: Python signing can fetch private key from device if not provided via file
         # The create_auth_token_async function will automatically try to export the key
         # from the device if private_key_hex is None and meshcore_instance is available
+
+        self._load_neighbors_config(config)
+
+    def _load_neighbors_config(self, config) -> None:
+        """Build the neighbors cycle configuration (see modules/neighbors_discovery.py).
+
+        Off by default: a cycle spends real airtime and, with scope collection
+        enabled, holds the shared radio command lock for seconds at a time.
+        """
+        self.neighbors_enabled = config.getboolean("PacketCapture", "neighbors_enabled", fallback=False)
+        self.neighbors_feed_mesh_graph = config.getboolean(
+            "PacketCapture", "neighbors_feed_mesh_graph", fallback=True
+        )
+
+        requested_interval = config.getint("PacketCapture", "neighbors_interval_hours", fallback=24)
+        self.neighbors_config = NeighborsConfig(
+            interval_hours=requested_interval,
+            discover_window=config.getfloat("PacketCapture", "neighbors_discover_window", fallback=60.0),
+            command_timeout=config.getfloat("PacketCapture", "neighbors_command_timeout", fallback=20.0),
+            collect_scopes=config.getboolean("PacketCapture", "neighbors_collect_scopes", fallback=False),
+            scope_timeout=config.getfloat("PacketCapture", "neighbors_scope_timeout", fallback=0.0),
+            scope_min_timeout=config.getfloat("PacketCapture", "neighbors_scope_min_timeout", fallback=8.0),
+            scope_gap=config.getfloat("PacketCapture", "neighbors_scope_gap", fallback=2.0),
+            cycle_timeout=config.getfloat("PacketCapture", "neighbors_cycle_timeout", fallback=600.0),
+            max_neighbors=config.getint("PacketCapture", "neighbors_max", fallback=32),
+            self_scopes=config.get("PacketCapture", "neighbors_self_scopes", fallback="").strip(),
+        )
+        # NeighborsConfig clamps out-of-range values; say so rather than silently
+        # honouring something different from what was configured.
+        if self.neighbors_enabled and self.neighbors_config.interval_hours != requested_interval:
+            self.logger.warning(
+                f"neighbors_interval_hours {requested_interval} is outside the supported "
+                f"{MIN_INTERVAL_HOURS}-{MAX_INTERVAL_HOURS}h range, "
+                f"using {self.neighbors_config.interval_hours}h"
+            )
+
+    def _load_neighbors_timestamp(self, key: str, label: str) -> float:
+        """Load and validate one neighbors wall-clock timestamp."""
+        try:
+            raw = self.bot.db_manager.get_metadata(key)
+        except Exception as e:
+            self.logger.debug(f"Could not read {label}: {e}")
+            return 0.0
+        if not raw:
+            return 0.0
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            self.logger.warning(f"Ignoring malformed {label} value: {raw!r}")
+            return 0.0
+        # A clock jump either way would otherwise pin the scheduler: a future
+        # timestamp suppresses cycles indefinitely, a nonsensical old one is noise.
+        now = time.time()
+        if value > now + 300 or value < now - (400 * 86400):
+            self.logger.warning(
+                f"Ignoring out-of-range {label} timestamp ({value})"
+            )
+            return 0.0
+        return value
+
+    def _load_neighbors_state(self) -> float:
+        """Last completed cycle timestamp, from bot_metadata.
+
+        Neighbors intervals are long (12-336h), so surviving a restart is what
+        keeps a bot that reboots often from re-running discovery every start.
+        """
+        return self._load_neighbors_timestamp(NEIGHBORS_STATE_KEY, "neighbors state")
+
+    def _load_neighbors_attempt_state(self) -> float:
+        """Last cycle that may have reached the radio, from bot_metadata."""
+        return self._load_neighbors_timestamp(
+            NEIGHBORS_ATTEMPT_STATE_KEY, "neighbors attempt state"
+        )
+
+    def _save_neighbors_timestamp(self, key: str, value: float, label: str) -> None:
+        """Persist one neighbors wall-clock timestamp."""
+        try:
+            self.bot.db_manager.set_metadata(key, str(value))
+        except Exception as e:
+            self.logger.debug(f"Could not save {label}: {e}")
+
+    def _save_neighbors_state(self) -> None:
+        """Persist the last cycle timestamp to bot_metadata."""
+        self._save_neighbors_timestamp(
+            NEIGHBORS_STATE_KEY, self.last_neighbors_publish, "neighbors state"
+        )
+
+    def _save_neighbors_attempt_state(self) -> None:
+        """Persist the last cycle that may have reached the radio."""
+        self._save_neighbors_timestamp(
+            NEIGHBORS_ATTEMPT_STATE_KEY,
+            self.last_neighbors_attempt,
+            "neighbors attempt state",
+        )
+
+    def _build_channel_key_store(self, config) -> ChannelKeyStore:
+        """Build a comprehensive channel key store for GRP_TXT decryption.
+
+        Sources (mirrors the web viewer's channel sourcing,
+        modules/web_viewer/app.py:_get_additional_decode_channels):
+          1. The bot's live radio channels (channel_manager, with real keys).
+          2. ``decode_hashtag_channels`` + the ``[Channels_List]`` section (keys derived).
+          3. Explicit ``decode_channel_keys`` = name=hexkey list.
+          4. The well-known default Public channel key (unless disabled).
+        """
+        store = ChannelKeyStore()
+
+        # 1. Bot's configured radio channels (have real key material).
+        try:
+            channel_manager = getattr(self.bot, "channel_manager", None)
+            if channel_manager:
+                for ch in channel_manager.get_configured_channels():
+                    key_hex = ch.get("channel_key_hex")
+                    if key_hex:
+                        store.add_hex(key_hex, ch.get("channel_name"))
+        except Exception as e:
+            self.logger.debug(f"Could not load channel_manager keys: {e}")
+
+        # 2a. decode_hashtag_channels: comma list of names (keys derived).
+        hashtag_raw = config.get("PacketCapture", "decode_hashtag_channels", fallback="")
+        for name in (n.strip() for n in hashtag_raw.split(",")):
+            if name:
+                store.add_hashtag(name)
+
+        # 2b. [Channels_List] section names (keys derived), matching web viewer behavior.
+        if config.has_section("Channels_List"):
+            for key in config.options("Channels_List"):
+                name = key.split(".")[-1] if "." in key else key
+                name = name.strip()
+                if name:
+                    store.add_hashtag(name)
+
+        # 3. Explicit name=hexkey pairs (hex or base64).
+        keys_raw = config.get("PacketCapture", "decode_channel_keys", fallback="")
+        for entry in (e.strip() for e in keys_raw.split(",")):
+            if not entry or "=" not in entry:
+                continue
+            name, _, key_str = entry.partition("=")
+            key_bytes = _decode_key_str(key_str.strip())
+            if key_bytes:
+                store.add_secret(key_bytes, name.strip())
+
+        # 4. Built-in default Public channel key.
+        if config.getboolean("PacketCapture", "decode_include_public", fallback=True):
+            store.add_secret(DEFAULT_PUBLIC_CHANNEL_KEY, "public")
+
+        self.logger.info(f"Payload decoding enabled with {len(store)} channel key(s)")
+        return store
 
     def _prune_correlation_caches(self, current_time: Optional[float] = None) -> None:
         """Drop stale rf_data_cache and recent_rf_packets entries.
@@ -299,15 +722,33 @@ class PacketCaptureService(BaseServicePlugin):
                 "topic_prefix": config.get("PacketCapture", f"mqtt{broker_num}_topic_prefix", fallback=None),
                 "topic_status": config.get("PacketCapture", f"mqtt{broker_num}_topic_status", fallback=None),
                 "topic_packets": config.get("PacketCapture", f"mqtt{broker_num}_topic_packets", fallback=None),
+                "topic_neighbors": config.get(
+                    "PacketCapture", f"mqtt{broker_num}_topic_neighbors", fallback=None
+                ),
+                # On by default, so `neighbors_enabled` is the single switch that
+                # turns the feature on everywhere. Set false per broker to hold one
+                # back. The whole feature is still off until neighbors_enabled.
+                "neighbors": config.getboolean(
+                    "PacketCapture", f"mqtt{broker_num}_neighbors", fallback=True
+                ),
                 "use_auth_token": config.getboolean(
                     "PacketCapture", f"mqtt{broker_num}_use_auth_token", fallback=False
                 ),
                 "token_audience": config.get("PacketCapture", f"mqtt{broker_num}_token_audience", fallback=None),
                 "transport": config.get("PacketCapture", f"mqtt{broker_num}_transport", fallback="tcp").lower(),
                 "use_tls": config.getboolean("PacketCapture", f"mqtt{broker_num}_use_tls", fallback=False),
+                "tls_insecure": config.getboolean(
+                    "PacketCapture", f"mqtt{broker_num}_tls_insecure", fallback=False
+                ),
+                "broker_num": broker_num,
                 "websocket_path": config.get("PacketCapture", f"mqtt{broker_num}_websocket_path", fallback="/mqtt"),
                 "client_id": config.get("PacketCapture", f"mqtt{broker_num}_client_id", fallback=None),
                 "upload_packet_types": upload_packet_types,
+                "include_decoded": config.getboolean(
+                    "PacketCapture",
+                    f"mqtt{broker_num}_include_decoded",
+                    fallback=getattr(self, "include_decoded", False),
+                ),
                 "jwt_renewal_interval": jwt_renewal_interval,
                 "jwt_ttl_seconds": jwt_ttl_seconds,
             }
@@ -394,6 +835,11 @@ class PacketCaptureService(BaseServicePlugin):
         return iat, iat + ttl
 
     @staticmethod
+    def _utc_iso_timestamp() -> str:
+        """UTC ISO 8601 timestamp with Z suffix for broad consumer compatibility."""
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
     def _jwt_ttl_log_phrase(ttl_seconds: int) -> str:
         """Short TTL description for log lines."""
         if ttl_seconds >= 3600 and ttl_seconds % 3600 == 0:
@@ -443,11 +889,18 @@ class PacketCaptureService(BaseServicePlugin):
 
         self.logger.info("Starting packet capture service...")
 
-        # Open output file if specified
+        # Open output file if specified (with optional size/time rotation)
         if self.output_file:
             try:
-                self.output_handle = open(self.output_file, "a")
-                self.logger.info(f"Writing packets to: {self.output_file}")
+                self.output_handle = _RotatingPacketLog(
+                    self.output_file,
+                    rotation=self.log_rotation,
+                    max_bytes=self.log_max_bytes,
+                    backup_count=self.log_backup_count,
+                    when=self.log_rotation_when,
+                )
+                rotation_note = "" if self.log_rotation == "off" else f" (rotation: {self.log_rotation})"
+                self.logger.info(f"Writing packets to: {self.output_file}{rotation_note}")
             except Exception as e:
                 self.logger.error(f"Failed to open output file: {e}")
 
@@ -587,14 +1040,18 @@ class PacketCaptureService(BaseServicePlugin):
                     # Correlate with RAW_DATA: cache SNR/RSSI for prefix; record hex for dedupe
                     # (meshcore-packet-capture: recent_rf_packets + rf_data_cache)
                     current_time = time.time()
-                    packet_prefix = raw_hex[:32] if len(raw_hex) >= 32 else raw_hex
+                    # Both correlation caches are keyed on UPPERCASE hex: this
+                    # payload arrives lowercase but handle_raw_data uppercases
+                    # before looking up, so the cases must be normalized here.
+                    raw_hex_key = raw_hex.upper()
+                    packet_prefix = raw_hex_key[:32] if len(raw_hex_key) >= 32 else raw_hex_key
                     self.rf_data_cache[packet_prefix] = {
                         "snr": payload.get("snr"),
                         "rssi": payload.get("rssi"),
                         "timestamp": current_time,
                         "payload_length": payload.get("payload_length"),
                     }
-                    self.recent_rf_packets[raw_hex.upper()] = current_time
+                    self.recent_rf_packets[raw_hex_key] = current_time
                     self._prune_correlation_caches(current_time)
 
                     # Process packet
@@ -625,13 +1082,16 @@ class PacketCaptureService(BaseServicePlugin):
                 return
 
             raw_hex_src = None
-            if hasattr(payload, "data"):
+            if isinstance(payload, dict):
+                # meshcore's reader dispatches RAW_DATA as
+                # {"SNR", "RSSI", "payload": "<hex>"} — "payload" is the real
+                # field; "data"/"raw_hex" are only kept for other producers.
+                for field in ("payload", "data", "raw_hex"):
+                    if payload.get(field):
+                        raw_hex_src = payload[field]
+                        break
+            elif hasattr(payload, "data"):
                 raw_hex_src = payload.data
-            elif isinstance(payload, dict):
-                if "data" in payload:
-                    raw_hex_src = payload["data"]
-                elif "raw_hex" in payload:
-                    raw_hex_src = payload["raw_hex"]
 
             if raw_hex_src is None:
                 return
@@ -667,9 +1127,18 @@ class PacketCaptureService(BaseServicePlugin):
             else:
                 merged_payload = {}
 
+            # RAW_DATA carries "SNR"/"RSSI"; RX_LOG_DATA and _format_packet_data
+            # use the lowercase spelling, so fold the event's own values in
+            # first — they are more specific than the prefix-matched cache.
+            for upper, lower in (("SNR", "snr"), ("RSSI", "rssi")):
+                if merged_payload.get(lower) is None and merged_payload.get(upper) is not None:
+                    merged_payload[lower] = merged_payload[upper]
+
             if rf_cached:
-                merged_payload.setdefault("snr", rf_cached.get("snr"))
-                merged_payload.setdefault("rssi", rf_cached.get("rssi"))
+                if merged_payload.get("snr") is None:
+                    merged_payload["snr"] = rf_cached.get("snr")
+                if merged_payload.get("rssi") is None:
+                    merged_payload["rssi"] = rf_cached.get("rssi")
                 pl = merged_payload.get("payload_length")
                 if pl is None:
                     merged_payload["payload_length"] = rf_cached.get("payload_length")
@@ -694,7 +1163,7 @@ class PacketCaptureService(BaseServicePlugin):
             dict[str, Any]: Formatted packet dictionary.
         """
         current_time = datetime.now()
-        timestamp = current_time.isoformat()
+        timestamp = self._utc_iso_timestamp()
 
         # Remove 0x prefix if present
         clean_raw_hex = raw_hex.replace("0x", "").upper()
@@ -819,6 +1288,25 @@ class PacketCaptureService(BaseServicePlugin):
         if route == "D" and packet_info.get("path"):
             packet_data["path"] = ",".join(packet_info["path"])
 
+        # Attach decoded payload (issues #197 & #35): plain text / structured fields.
+        # Only payload-specific content goes here — header fields (packet_type, route)
+        # already exist at the top level, so we don't restate them.
+        if self.decode_payloads and self.channel_key_store is not None:
+            try:
+                payload_type_value = packet_info.get("payload_type_value", 0)
+                if hasattr(payload_type_value, "value"):
+                    payload_type_value = payload_type_value.value
+                payload_bytes = bytes.fromhex(packet_info.get("payload_hex", "") or "")
+                decoded = decode_payload(int(payload_type_value), payload_bytes, self.channel_key_store)
+                # Include the decoded hop path only when it isn't already at the top level
+                # (top-level "path" is added for route=D) — captures flood paths without duplicating.
+                if packet_info.get("path") and "path" not in packet_data:
+                    decoded["path"] = list(packet_info["path"])
+                packet_data["decoded"] = decoded
+            except Exception as e:
+                if self.debug:
+                    self.logger.debug(f"Payload decode failed: {e}")
+
         return packet_data
 
     async def process_packet(
@@ -896,8 +1384,7 @@ class PacketCaptureService(BaseServicePlugin):
 
             # Write to file
             if self.output_handle:
-                self.output_handle.write(json.dumps(formatted_packet, default=str) + "\n")
-                self.output_handle.flush()
+                self.output_handle.write_line(json.dumps(formatted_packet, default=str))
 
             # Publish to MQTT if enabled
             # The publish function will check per-broker connection status
@@ -1154,7 +1641,20 @@ class PacketCaptureService(BaseServicePlugin):
 
                         # For WebSockets with TLS (WSS), we need to set TLS on the client
                         # The TLS handshake happens during the WebSocket upgrade
-                        client.tls_set(cert_reqs=ssl.CERT_NONE)  # Allow self-signed certs
+                        if broker_config.get("tls_insecure", False):
+                            # Explicitly opted out — accepts self-signed certs.
+                            client.tls_set(cert_reqs=ssl.CERT_NONE)
+                            client.tls_insecure_set(True)
+                            self.logger.warning(
+                                "TLS certificate verification is DISABLED for %s "
+                                "(mqtt%s_tls_insecure = true) — credentials are exposed to a MITM",
+                                broker_config["host"], broker_config.get("broker_num", "N"),
+                            )
+                        else:
+                            # Verify certificate and hostname against the system
+                            # trust store; the credentials set below would
+                            # otherwise be readable by any interceptor.
+                            client.tls_set(cert_reqs=ssl.CERT_REQUIRED)
                         if self.debug:
                             self.logger.debug(f"TLS enabled for {broker_config['host']} ({transport})")
                     except Exception as e:
@@ -1505,7 +2005,12 @@ class PacketCaptureService(BaseServicePlugin):
                 if not topic:
                     continue
 
-                payload = json.dumps(packet_info, default=str)
+                # Per-broker: strip the decoded object for brokers that opt out.
+                broker_packet = packet_info
+                if "decoded" in packet_info and not config.get("include_decoded", False):
+                    broker_packet = {k: v for k, v in packet_info.items() if k != "decoded"}
+
+                payload = json.dumps(broker_packet, default=str)
 
                 # Log topic and payload size for debugging
                 self.logger.debug(f"Publishing to topic '{topic}' on {config['host']} (payload: {len(payload)} bytes)")
@@ -1562,6 +2067,481 @@ class PacketCaptureService(BaseServicePlugin):
             task = asyncio.create_task(self.mqtt_reconnection_monitor())
             self.background_tasks.append(task)
 
+        # Neighbors discovery. Unlike the upstream capture tool this does not
+        # require a broker: the database is a legitimate consumer on its own, so
+        # the cycle runs whenever the feature is enabled and publishes to
+        # whichever brokers opted in (possibly none).
+        if self.neighbors_enabled:
+            self.neighbors_task = asyncio.create_task(self.neighbors_scheduler())
+            self.background_tasks.append(self.neighbors_task)
+
+    def neighbors_brokers(self) -> list[dict[str, Any]]:
+        """Connected MQTT clients whose broker opted into the neighbors topic."""
+        return [
+            info for info in self.mqtt_clients
+            if info.get("connected", False) and info["config"].get("neighbors", False)
+        ]
+
+    def neighbors_commands_available(self) -> bool:
+        """Detect whether the connected build exposes the neighbors commands.
+
+        ``send_node_discover_req`` needs companion CMD_SEND_CONTROL_DATA (v8+);
+        ``req_regions_sync`` needs CMD_SEND_ANON_REQ and is only required when
+        scope collection is enabled. Logged once per state change, like stats.
+        """
+        if not self.meshcore or not hasattr(self.meshcore, "commands"):
+            return False
+
+        commands = self.meshcore.commands
+        required = ["send_node_discover_req"]
+        if self.neighbors_config.collect_scopes:
+            required.append("req_regions_sync")
+        available = all(callable(getattr(commands, attr, None)) for attr in required)
+        state = "available" if available else "missing"
+        if state != self.neighbors_capability_state:
+            if available:
+                self.logger.info("MeshCore neighbors commands detected - neighbors discovery enabled")
+            else:
+                self.logger.warning(
+                    "MeshCore neighbors commands not available - neighbors discovery disabled "
+                    "(needs a newer firmware/meshcore build)"
+                )
+            self.neighbors_capability_state = state
+        return available
+
+    def _neighbors_topic_template(self, broker_config: dict[str, Any]) -> Optional[str]:
+        """Unresolved neighbors topic template for one broker.
+
+        Order matters because brokers publish neighbors by default, so the derived
+        value has to be *correct*, not merely non-empty:
+
+        1. Explicit ``topic_neighbors`` always wins.
+        2. Otherwise swap the last segment of ``topic_packets``. A broker
+           configured with ``meshcore/{IATA}/{PUBLIC_KEY}/packets`` then gets
+           ``meshcore/{IATA}/{PUBLIC_KEY}/neighbors`` — the topic the firmware
+           actually publishes — instead of an unrelated flat topic.
+        3. Otherwise ``<topic_prefix>/neighbors``, mirroring how the packet path
+           falls back to ``<prefix>/packet``.
+        """
+        explicit = broker_config.get("topic_neighbors")
+        if explicit:
+            return explicit
+
+        packets = broker_config.get("topic_packets")
+        if packets:
+            if "/" in packets:
+                return packets.rsplit("/", 1)[0] + "/neighbors"
+            return "neighbors"
+
+        prefix = broker_config.get("topic_prefix")
+        if prefix:
+            return f"{prefix}/neighbors"
+        return None
+
+    def _iata_is_unset(self) -> bool:
+        """True when no real IATA is configured (blank or the XYZ sentinel)."""
+        return (not self.global_iata) or self.global_iata == DEFAULT_IATA.lower()
+
+    def _resolve_neighbors_topic(self, broker_config: dict[str, Any]) -> Optional[str]:
+        """Resolved topic for one broker's neighbors snapshot, or None if unroutable."""
+        template = self._neighbors_topic_template(broker_config)
+        if not template:
+            return None
+
+        # An unset IATA is blank or the documented sentinel "XYZ", and this topic
+        # is location-routed on the community brokers. Publishing a snapshot to
+        # meshcore/XYZ/... (or meshcore//...) would pollute a shared namespace, so
+        # refuse instead — matching the upstream rule that neighbors needs a real
+        # IATA to route. Only applies to a template we derived; an explicit topic
+        # is the operator's call.
+        # .upper() catches both the {IATA} and {iata} placeholder spellings.
+        if (
+            not broker_config.get("topic_neighbors")
+            and "{IATA}" in template.upper()
+            and self._iata_is_unset()
+        ):
+            return None
+
+        return self._resolve_topic_template(template, "neighbors")
+
+    def publish_neighbors_mqtt(self, message: dict[str, Any]) -> dict[str, int]:
+        """Publish a neighbors snapshot to every opted-in, connected broker.
+
+        Non-retained: a snapshot taken every 12-336h is not a useful last-will
+        value, and a stale retained copy would read as current.
+        """
+        metrics = {"attempted": 0, "succeeded": 0}
+        if not self.mqtt_enabled or mqtt is None:
+            return metrics
+
+        payload = json.dumps(message, default=str)
+        for mqtt_client_info in self.neighbors_brokers():
+            config = mqtt_client_info["config"]
+            broker_num = config.get("broker_num", 0)
+            host = config.get("host", "unknown")
+            topic = self._resolve_neighbors_topic(config)
+            if not topic:
+                # Warn once per broker: the cycle spent real airtime, so silently
+                # dropping the result would be worse than noisy.
+                if broker_num not in self.neighbors_topic_warned:
+                    self.neighbors_topic_warned.add(broker_num)
+                    template = self._neighbors_topic_template(config)
+                    if template and "{IATA}" in template.upper():
+                        reason = (
+                            f"its topic is location-routed ({template}) but no IATA is set; "
+                            f"set [PacketCapture] iata, or mqtt{broker_num}_topic_neighbors "
+                            f"to a topic that does not need one"
+                        )
+                    else:
+                        reason = (
+                            f"no neighbors topic could be resolved (set "
+                            f"mqtt{broker_num}_topic_neighbors or a topic prefix)"
+                        )
+                    self.logger.warning(
+                        f"Not publishing neighbors to {host}: {reason}"
+                    )
+                continue
+
+            try:
+                metrics["attempted"] += 1
+                result = mqtt_client_info["client"].publish(topic, payload, qos=0, retain=False)
+                if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                    metrics["succeeded"] += 1
+                    self.logger.debug(f"Published neighbors to '{topic}' on {host}")
+                else:
+                    self.logger.warning(
+                        f"Failed to publish neighbors to '{topic}' on {host}: "
+                        f"{result.rc} ({mqtt.error_string(result.rc)})"
+                    )
+            except Exception as e:
+                self.logger.error(f"Error publishing neighbors to MQTT on {host}: {e}")
+
+        return metrics
+
+    def _feed_mesh_graph(self, self_pubkey: str, entries: list[Any]) -> None:
+        """Add each confirmed direct link to the mesh graph, both directions.
+
+        Both directions are correct: a discover response proves we transmitted,
+        they received, they transmitted, and we received.
+
+        Note that ``mesh_connections`` cannot represent *why* an edge exists —
+        its multi-byte confirmation flag is memory-only and never persisted — so
+        ``neighbor_links`` remains the source of truth for this evidence, and the
+        viewer derives its neighbors evidence mode from that table instead.
+        """
+        mesh_graph = getattr(self.bot, "mesh_graph", None)
+        if not mesh_graph or not self_pubkey:
+            return
+
+        self_prefix = self_pubkey.lower()[:6]
+        added = 0
+        for entry in entries:
+            neighbor_prefix = entry.pubkey.lower()[:6]
+            if not neighbor_prefix or neighbor_prefix == self_prefix:
+                continue
+            try:
+                # hop_position 1: a direct link is the first hop of any path
+                # through it. add_edge honours the graph capture kill-switch.
+                mesh_graph.add_edge(
+                    self_prefix, neighbor_prefix,
+                    from_public_key=self_pubkey.lower(),
+                    to_public_key=entry.pubkey.lower(),
+                    hop_position=1, prefix_bytes=2,
+                )
+                mesh_graph.add_edge(
+                    neighbor_prefix, self_prefix,
+                    from_public_key=entry.pubkey.lower(),
+                    to_public_key=self_pubkey.lower(),
+                    hop_position=1, prefix_bytes=2,
+                )
+                added += 2
+            except Exception as e:
+                self.logger.debug(f"Neighbors: could not add graph edge for {neighbor_prefix}: {e}")
+
+        if added and self.debug:
+            self.logger.debug(f"Neighbors: fed {added} mesh graph edge(s)")
+
+    def _device_public_key(self) -> str:
+        """This node's public key, lowercase hex, or '' when unavailable."""
+        if not self.meshcore or not hasattr(self.meshcore, "self_info"):
+            return ""
+        try:
+            self_info = self.meshcore.self_info
+            if isinstance(self_info, dict):
+                key = self_info.get("public_key", "")
+            else:
+                key = getattr(self_info, "public_key", "")
+            if isinstance(key, (bytes, bytearray)):
+                key = bytes(key).hex()
+            key = str(key or "").replace("0x", "").replace(" ", "").strip().lower()
+            return "" if key in ("", "unknown") else key
+        except Exception as e:
+            self.logger.debug(f"Could not read device public key: {e}")
+            return ""
+
+    @staticmethod
+    def _empty_neighbors_summary(reason: str = "") -> dict[str, Any]:
+        """A cycle summary that reports no work done, optionally with a reason."""
+        return {
+            "ok": False, "reason": reason, "discovered": 0, "queried": 0,
+            "best_snr": None, "attempted": 0, "succeeded": 0, "recorded": 0,
+        }
+
+    def neighbors_cooldown_remaining(self) -> float:
+        """Seconds until another cycle may reach the radio.
+
+        Measured from the last cycle that got as far as transmitting, whichever
+        trigger started it — so a cycle that failed on a lost acknowledgement
+        still counts, because the discover broadcast went out regardless. A cycle
+        that bailed before touching the radio stamps nothing and so costs nothing.
+        """
+        last = max(self.last_neighbors_attempt, self.last_neighbors_publish)
+        if last <= 0:
+            return 0.0
+        return max(0.0, MIN_CYCLE_GAP_SECONDS - (time.time() - last))
+
+    def claim_neighbors_cycle(self) -> Optional[str]:
+        """Claim the single-flight lock before a cycle reaches the radio.
+
+        Returns ``None`` when claimed. Returns a refusal reason when another
+        cycle is already running or the airtime cooldown has not expired.
+
+        The ``neighbors`` command claims *before* acknowledging so an await
+        cannot let the scheduler sneak in and turn "started" into an immediate
+        failure. Pair every successful claim with ``release_neighbors_cycle``
+        (``run_neighbors_cycle`` does this in ``finally``).
+        """
+        if self.neighbors_cycle_active:
+            self.logger.info(
+                "Neighbors: a discovery cycle is already running, skipping this trigger"
+            )
+            return "a discovery cycle is already running"
+
+        cooldown = self.neighbors_cooldown_remaining()
+        if cooldown > 0:
+            self.logger.info(
+                f"Neighbors: last cycle was too recent, {cooldown:.0f}s left before "
+                f"another may run"
+            )
+            return f"another cycle may run in {cooldown:.0f}s"
+
+        self.neighbors_cycle_active = True
+        return None
+
+    def release_neighbors_cycle(self) -> None:
+        """Drop the single-flight lock claimed by ``claim_neighbors_cycle``."""
+        self.neighbors_cycle_active = False
+
+    async def run_neighbors_cycle(self, *, already_claimed: bool = False) -> dict[str, Any]:
+        """Run one discovery cycle, subject to the airtime guards.
+
+        Both guards live here rather than in a caller, because the scheduler, the
+        ``neighbors`` command and any future trigger all reach the same radio:
+
+        * no overlap — two concurrent cycles would each collect the other's
+          discover responses and spend twice the airtime for no extra information;
+        * no cycle within ``MIN_CYCLE_GAP_SECONDS`` of the last one that
+          transmitted.
+
+        Pass ``already_claimed=True`` when the caller has successfully called
+        ``claim_neighbors_cycle`` (the manual command does this so it can
+        acknowledge only after the lock is held).
+
+        Returns a summary dict (also used by the ``neighbors`` command):
+        ``{'ok', 'reason', 'discovered', 'queried', 'best_snr', 'attempted',
+        'succeeded', 'recorded'}``.
+        """
+        if not already_claimed:
+            reason = self.claim_neighbors_cycle()
+            if reason is not None:
+                return self._empty_neighbors_summary(reason)
+
+        try:
+            return await self._run_neighbors_cycle()
+        finally:
+            self.release_neighbors_cycle()
+
+    async def _run_neighbors_cycle(self) -> dict[str, Any]:
+        """One discovery cycle: record it, feed the graph, publish it.
+
+        Always call through run_neighbors_cycle, which holds the single-flight
+        guard for the whole cycle.
+        """
+        summary = self._empty_neighbors_summary()
+
+        if not self.neighbors_enabled:
+            summary["reason"] = "neighbors discovery is disabled"
+            return summary
+        if not self.meshcore or not self.bot.connected:
+            summary["reason"] = "radio not connected"
+            return summary
+        if not self.neighbors_commands_available():
+            summary["reason"] = "radio build does not support neighbor discovery"
+            return summary
+
+        cfg = self.neighbors_config
+        self_pubkey = self._device_public_key()
+        self.logger.info("Neighbors: starting discovery cycle")
+
+        # A reconnect swaps in a fresh MeshCore object and clears every event
+        # subscription, so a cycle spanning one is collecting into a dead handler.
+        session = self.meshcore
+
+        def session_intact() -> bool:
+            return self.meshcore is session and self.bot.connected
+
+        # Stamp the attempt before the request, not after the cycle: from here on
+        # the discover broadcast may go out and spend airtime even if we never
+        # learn that it did (a lost acknowledgement fails the cycle without
+        # stamping last_neighbors_publish). Rate limiting has to charge for the
+        # transmission, not for the result. Persist this to ration requests
+        # across restarts as well. It is separate from
+        # last_neighbors_publish so a failed cycle retries after the short airtime
+        # gap rather than waiting the full configured schedule interval.
+        self.last_neighbors_attempt = time.time()
+        self._save_neighbors_attempt_state()
+
+        entries = await discover_neighbors(
+            self.meshcore, cfg, self_pubkey, self.logger,
+            debug=self.debug, still_valid=session_intact,
+        )
+        if entries is None:
+            # A build that rejects the discover command fails every cycle; warn
+            # once rather than on every wakeup forever.
+            self.neighbors_discover_failures += 1
+            if self.neighbors_discover_failures == 1:
+                self.logger.warning(
+                    "Neighbors: discovery request failed; will keep retrying quietly "
+                    "on the configured interval"
+                )
+            else:
+                self.logger.debug(
+                    f"Neighbors: discovery request failed "
+                    f"({self.neighbors_discover_failures} consecutive)"
+                )
+            summary["reason"] = "discovery request failed"
+            return summary
+        self.neighbors_discover_failures = 0
+
+        total_discovered = len(entries)
+        summary["discovered"] = total_discovered
+        if total_discovered > cfg.max_neighbors:
+            self.logger.info(
+                f"Neighbors: {total_discovered} discovered, keeping the "
+                f"{cfg.max_neighbors} most useful"
+            )
+            entries = entries[:cfg.max_neighbors]
+
+        self.logger.info(f"Neighbors: {len(entries)} neighbor(s) discovered")
+        await collect_scopes(self.meshcore, entries, cfg, self.logger, debug=self.debug)
+
+        if not session_intact():
+            self.logger.warning(
+                "Neighbors: device session was reset mid-cycle, discarding this cycle "
+                "rather than recording partial data"
+            )
+            summary["reason"] = "device session reset mid-cycle"
+            return summary
+
+        summary["queried"] = len(entries)
+        if entries:
+            summary["best_snr"] = max(e.snr for e in entries)
+
+        # Record before publishing: the data is valuable on its own, and a broker
+        # problem must not cost us the observation.
+        if entries and self_pubkey:
+            summary["recorded"] = record_neighbors(
+                self.bot.db_manager, self_pubkey, entries, self.logger
+            )
+        elif entries and not self_pubkey:
+            self.logger.warning(
+                "Neighbors: device public key unavailable, cannot record links "
+                "(an unattributed link is not usable evidence)"
+            )
+
+        if entries and self.neighbors_feed_mesh_graph and self_pubkey:
+            self._feed_mesh_graph(self_pubkey, entries)
+
+        self_scopes = await fetch_self_scopes(self.meshcore, cfg, self.logger)
+        origin_id = self_pubkey.upper() if self_pubkey else "DEVICE"
+        message, dropped = build_neighbors_message(
+            self._get_bot_name() or "MeshCore Device",
+            origin_id, self_scopes, entries,
+            total_neighbors=total_discovered,
+        )
+        if dropped:
+            self.logger.warning(
+                f"Neighbors: payload budget reached, dropped {dropped} least-useful entry(ies)"
+            )
+
+        metrics = self.publish_neighbors_mqtt(message)
+        summary["attempted"] = metrics["attempted"]
+        summary["succeeded"] = metrics["succeeded"]
+
+        responded = sum(1 for e in entries if e.status == STATUS_RESPONDED)
+        if metrics["attempted"]:
+            self.logger.info(
+                f"Neighbors: published {len(message['neighbors'])} entry(ies) "
+                f"({responded} responded) to {metrics['succeeded']}/{metrics['attempted']} broker(s)"
+            )
+        else:
+            self.logger.info(
+                f"Neighbors: recorded {summary['recorded']} link(s); "
+                f"no broker has neighbors enabled, nothing published"
+            )
+
+        # Stamp the attempt even when nothing was published, so a persistently
+        # failing broker cannot turn every wakeup into a fresh discovery burst.
+        self.last_neighbors_publish = time.time()
+        self._save_neighbors_state()
+        summary["ok"] = True
+        return summary
+
+    async def neighbors_scheduler(self) -> None:
+        """Run a discovery cycle on the configured interval."""
+        interval_seconds = self.neighbors_config.interval_seconds
+        if self.debug:
+            self.logger.debug(
+                f"Starting neighbors scheduler "
+                f"({self.neighbors_config.interval_hours}h interval)"
+            )
+
+        while not self.should_exit:
+            try:
+                time_since_last = time.time() - self.last_neighbors_publish
+                if time_since_last < interval_seconds:
+                    sleep_time = interval_seconds - time_since_last
+                    if self.debug:
+                        self.logger.debug(f"Next neighbors cycle in {sleep_time / 3600:.1f} hours")
+                    if await self._wait_with_shutdown(sleep_time):
+                        break
+                    continue
+
+                await self.run_neighbors_cycle()
+
+                # run_neighbors_cycle stamps last_neighbors_publish when it got as
+                # far as a result. If it bailed early (not connected, unsupported
+                # build) back off before retrying so we re-check periodically
+                # rather than spinning — but never retry inside the airtime
+                # cooldown: a cycle that failed on a lost acknowledgement already
+                # put a discover broadcast on the air, and retrying every
+                # NEIGHBORS_RETRY_BACKOFF_SECONDS would spend triple the intended
+                # airtime.
+                if (time.time() - self.last_neighbors_publish) >= interval_seconds:
+                    backoff = max(NEIGHBORS_RETRY_BACKOFF_SECONDS,
+                                  self.neighbors_cooldown_remaining())
+                    if await self._wait_with_shutdown(backoff):
+                        break
+
+            except asyncio.CancelledError:
+                if self.debug:
+                    self.logger.debug("Neighbors scheduler cancelled")
+                break
+            except Exception as e:
+                self.logger.error(f"Error in neighbors scheduler: {e}")
+                if await self._wait_with_shutdown(NEIGHBORS_RETRY_BACKOFF_SECONDS):
+                    break
+
     async def stats_refresh_scheduler(self) -> None:
         """Periodically refresh stats and publish them via MQTT (matches original script).
 
@@ -1602,7 +2582,7 @@ class PacketCaptureService(BaseServicePlugin):
     def _load_client_version(self) -> str:
         """Load client version from shared runtime resolver."""
         try:
-            info = resolve_runtime_version(self.bot.bot_root)
+            info = resolve_application_version()
             display = info.get("display") or "unknown"
             return f"meshcore-bot/{display}"
         except Exception as e:
@@ -1839,7 +2819,7 @@ class PacketCaptureService(BaseServicePlugin):
 
         status_msg = {
             "status": status,
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": self._utc_iso_timestamp(),
             "origin": device_name,
             "origin_id": device_public_key,
             "model": firmware_info.get("model", "unknown"),

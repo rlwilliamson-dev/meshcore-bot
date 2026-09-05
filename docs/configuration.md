@@ -15,10 +15,25 @@ The main sections include:
 | `[Bot]` | Bot name, database path, response toggles, command prefix |
 | `[Connection]` | Serial, BLE, or TCP connection to the MeshCore device |
 | `[Channels]` | Channels to monitor, DM behavior, optional channel keyword whitelist |
+| `[Localization]` | Default response language and optional sender-language detection |
 | `[Admin_ACL]` | Admin public keys and admin-only commands |
 | `[Keywords]` | Keyword → response pairs |
 | `[Weather]` | Units and settings shared by `wx` / `gwx` and Weather Service |
 | `[Logging]` | Log file path and level |
+
+### Connection: type and precedence
+
+`connection_type` in `[Connection]` selects the transport. **Only the matching keys are read**; other keys in the section are ignored at runtime (no error).
+
+| `connection_type` | Keys used | Notes |
+|-------------------|-----------|--------|
+| `serial` | `serial_port` | USB serial device path |
+| `ble` | `ble_device_name` | Empty = auto-detect first BLE device |
+| `tcp` | `hostname`, `tcp_port` | `hostname` required; `tcp_port` defaults to 5000 |
+
+Do not use `host` or `port` under `[Connection]` — those names are for `[Web_Viewer]` and `[Webhook]` listen addresses. TCP client connect uses `hostname` and `tcp_port`.
+
+`config.ini.example` lists all connection keys uncommented so the config TUI and migrate tool recognize them. Lean templates (`minimal-example`, `quickstart`) comment out BLE/TCP keys by default because they ship with `connection_type = serial`.
 
 ### Connection: transport reconnect
 
@@ -36,6 +51,24 @@ See `config.ini.example` for defaults and `radio_probe_*` / `radio_offline_*` al
 - **Live changes (web viewer):** The Config tab can store **`maint.log_max_bytes`** and **`maint.log_backup_count`** in the database (`bot_metadata`). The scheduler’s maintenance loop applies those values to the existing rotating file handler **without restarting** the bot—**but only after** you save rotation settings from the web UI (which writes the metadata keys). Editing `config.ini` alone does not update `bot_metadata`, so hot-apply will not see a change until you save from the viewer (or set the keys another way).
 
 If you rely on config-file-only workflows, restart the bot after changing `[Logging]` rotation options.
+
+### Localization
+
+`[Localization] language` selects the bot's default translation catalog.
+Set `auto_detect_language = true` to let greeting-style commands reply in the
+sender's detected language when that translation is installed. Detection is
+keyword-first so short mesh greetings such as `hola`, `bonjour`, and `hallo`
+work without another dependency.
+
+For statistical detection of longer messages, install the optional extra:
+
+```bash
+pip install "meshcore-bot[lang]"
+```
+
+Detection is opt-in and falls back to the configured default language whenever
+the message is ambiguous, the detector is unavailable, or the corresponding
+translation catalog is absent.
 
 ## Channels section
 
@@ -128,7 +161,21 @@ Common per-command options (when supported by that command):
   - Comma list: only those channels
 - **`aliases`** – Extra trigger words for that command, comma-separated **stems only** (e.g. `aliases = weather, w`). Do not put the bot's **`command_prefix`** or punctuation in this value (no `!` or `.`)
 
+### Command prefix
+
+Under `[Bot]`:
+
+- **`command_prefix`** – Optional global prefix(es) for commands. A single value (`!`, `abc`), comma-separated list (`!, ~, .`), or concatenated decorative characters (`!~.`) where the **first** entry is shown in help/docs. Leave empty for bare commands (legacy leading `!` is still accepted).
+- **`require_command_prefix`** – When `true` (default), messages must start with a configured prefix. When `false`, configured prefix(es) are stripped when present but bare commands also work. Ignored when `command_prefix` is empty.
+
 Full reference: see `config.ini.example` in the repository for every section and option, with inline comments.
+
+### Config templates
+
+- **`config.ini.example`** – Authoritative full reference; edit this when adding options or sections.
+- **`config.ini.minimal-example`** – Lean config for core testing commands only (ping, version, test, path, prefix, multitest). Hand-maintained; see its header for purpose. Point users to `config.ini.example` for full options when enabling more features.
+- **`config.ini.quickstart`** – Short easy-start config with a few common commands enabled. Hand-maintained.
+- **`scripts/config_tui.py`** (`make config`) – Uses documented keys from `config.ini.example` (including commented `#key =` lines) for validation and migrate.
 
 ## Data retention
 
@@ -159,3 +206,19 @@ Admins can DM **`channelpause`** or **`channelresume`** (see `[Admin_ACL]` in `c
 ## Scheduled messages (`[Scheduled_Messages]`)
 
 Each entry is `<schedule_key> = <value>` where the value is normally **`channel:message`** (first colon separates channel from body). For **regional flood scope** on that send only, use **`channel:#scope:message`**: the middle segment must start with `#` (same convention as `flood_scopes` / `outgoing_flood_scope_override`). The message body may contain more colons. Omit the middle field for classic global flood. See `config.ini.example` under `[Scheduled_Messages]` for examples. The **`schedule`** command lists each job with `(#scope)` when set.
+
+### Schedule keys (APScheduler cron, not Vixie)
+
+Schedule keys are parsed by **APScheduler** `CronTrigger.from_crontab` (plus `@` presets and deprecated `HHMM`). Field order is the usual five: `minute hour day-of-month month day-of-week`.
+
+**Day-of-week numbering differs from classic Vixie / crontab(5):**
+
+| | APScheduler (this bot) | Vixie cron |
+| --- | --- | --- |
+| `0` | Monday | Sunday |
+| `1` … `6` | Tuesday … Sunday | Monday … Saturday |
+| `7` | Invalid | Often accepted as Sunday |
+
+Prefer **`mon`–`sun`** names in the DOW field so expressions stay unambiguous. Example: Monday 12:30 is `30 12 * * mon` or `30 12 * * 0` — **not** Vixie’s `30 12 * * 1` (that is Tuesday here).
+
+Preset aliases expand to those same APScheduler forms. In particular **`@weekly`** is Monday 00:00 (`0 0 * * 0`), not Sunday midnight as on many Unix crons.

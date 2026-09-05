@@ -10,9 +10,9 @@ import re
 import socket
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Mapping, Optional, Union
 
 try:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -55,6 +55,57 @@ def get_config_timezone(config: Any, logger: Optional[Any] = None) -> tuple[Any,
     # System timezone for datetime; use "UTC" for API when we don't have an IANA name
     tz = datetime.now().astimezone().tzinfo
     return (tz, "UTC")
+
+
+def espn_dates_for_local_day(
+    local_tz: Any,
+    now: Optional[datetime] = None,
+) -> tuple[str, str, float, float]:
+    """Return ESPN scoreboard date range and local-day bounds for filtering events.
+
+    ESPN buckets scoreboard events by UTC calendar date. A single local calendar day
+    can span two UTC dates (e.g. 9pm PT is the next UTC day). This returns the
+    min/max YYYYMMDD strings to query, plus local midnight timestamps for filtering.
+
+    Returns:
+        (start_yyyymmdd, end_yyyymmdd, local_start_ts, local_end_ts)
+    """
+    if now is None:
+        now = datetime.now(local_tz)
+    elif now.tzinfo is None:
+        if hasattr(local_tz, 'localize'):
+            now = local_tz.localize(now)
+        else:
+            now = now.replace(tzinfo=local_tz)
+    else:
+        now = now.astimezone(local_tz)
+
+    if hasattr(local_tz, 'localize'):
+        local_start = local_tz.localize(datetime(now.year, now.month, now.day))
+    else:
+        local_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    local_end = local_start + timedelta(days=1)
+
+    utc_dates = {
+        local_start.astimezone(timezone.utc).strftime("%Y%m%d"),
+        (local_end - timedelta(seconds=1)).astimezone(timezone.utc).strftime("%Y%m%d"),
+    }
+    return min(utc_dates), max(utc_dates), local_start.timestamp(), local_end.timestamp()
+
+
+def filter_events_local_day(
+    events: list[dict],
+    local_start_ts: float,
+    local_end_ts: float,
+    ts_key: str = "event_timestamp",
+) -> list[dict]:
+    """Keep events whose kickoff falls in [local_start, local_end); keep missing timestamps."""
+    filtered: list[dict] = []
+    for event in events:
+        ts = event.get(ts_key)
+        if ts is None or (local_start_ts <= ts < local_end_ts):
+            filtered.append(event)
+    return filtered
 
 
 def format_temperature_high_low(
@@ -812,12 +863,14 @@ def get_nominatim_geocoder(user_agent: str = "meshcore-bot", timeout: int = 10) 
     return Nominatim(user_agent=user_agent, timeout=timeout)
 
 
-async def rate_limited_nominatim_geocode(bot: Any, query: str, timeout: int = 10) -> Optional[Any]:
+async def rate_limited_nominatim_geocode(
+    bot: Any, query: Union[str, Mapping[str, str]], timeout: int = 10
+) -> Optional[Any]:
     """Perform rate-limited Nominatim geocoding (forward geocoding).
 
     Args:
         bot: Bot instance (must have nominatim_rate_limiter attribute).
-        query: Location query string.
+        query: Location query string or structured Nominatim dict (e.g. postalcode).
         timeout: Request timeout in seconds.
 
     Returns:
@@ -826,19 +879,13 @@ async def rate_limited_nominatim_geocode(bot: Any, query: str, timeout: int = 10
     if not hasattr(bot, 'nominatim_rate_limiter'):
         # Fallback if rate limiter not initialized
         geolocator = get_nominatim_geocoder(timeout=timeout)
-        return geolocator.geocode(query, timeout=timeout)
+        return await asyncio.to_thread(geolocator.geocode, query, timeout=timeout)
 
-    # Wait for rate limiter
-    await bot.nominatim_rate_limiter.wait_for_request()
+    # Atomically reserve a slot shared with synchronous worker-thread callers.
+    await bot.nominatim_rate_limiter.wait_and_request()
 
-    # Make the request
     geolocator = get_nominatim_geocoder(timeout=timeout)
-    result = geolocator.geocode(query, timeout=timeout)
-
-    # Record the request
-    bot.nominatim_rate_limiter.record_request()
-
-    return result
+    return await asyncio.to_thread(geolocator.geocode, query, timeout=timeout)
 
 
 async def rate_limited_nominatim_reverse(bot: Any, coordinates: str, timeout: int = 10) -> Optional[Any]:
@@ -855,27 +902,23 @@ async def rate_limited_nominatim_reverse(bot: Any, coordinates: str, timeout: in
     if not hasattr(bot, 'nominatim_rate_limiter'):
         # Fallback if rate limiter not initialized
         geolocator = get_nominatim_geocoder(timeout=timeout)
-        return geolocator.reverse(coordinates, timeout=timeout)
+        return await asyncio.to_thread(geolocator.reverse, coordinates, timeout=timeout)
 
-    # Wait for rate limiter
-    await bot.nominatim_rate_limiter.wait_for_request()
+    # Atomically reserve a slot shared with synchronous worker-thread callers.
+    await bot.nominatim_rate_limiter.wait_and_request()
 
-    # Make the request
     geolocator = get_nominatim_geocoder(timeout=timeout)
-    result = geolocator.reverse(coordinates, timeout=timeout)
-
-    # Record the request
-    bot.nominatim_rate_limiter.record_request()
-
-    return result
+    return await asyncio.to_thread(geolocator.reverse, coordinates, timeout=timeout)
 
 
-def rate_limited_nominatim_geocode_sync(bot: Any, query: str, timeout: int = 10) -> Optional[Any]:
+def rate_limited_nominatim_geocode_sync(
+    bot: Any, query: Union[str, Mapping[str, str]], timeout: int = 10
+) -> Optional[Any]:
     """Perform rate-limited Nominatim geocoding (synchronous version).
 
     Args:
         bot: Bot instance (must have nominatim_rate_limiter attribute).
-        query: Location query string.
+        query: Location query string or structured Nominatim dict (e.g. postalcode).
         timeout: Request timeout in seconds.
 
     Returns:
@@ -886,17 +929,11 @@ def rate_limited_nominatim_geocode_sync(bot: Any, query: str, timeout: int = 10)
         geolocator = get_nominatim_geocoder(timeout=timeout)
         return geolocator.geocode(query, timeout=timeout)
 
-    # Wait for rate limiter
-    bot.nominatim_rate_limiter.wait_for_request_sync()
+    # Reserve the slot before the request, not after: this runs on worker threads.
+    bot.nominatim_rate_limiter.wait_and_request_sync()
 
-    # Make the request
     geolocator = get_nominatim_geocoder(timeout=timeout)
-    result = geolocator.geocode(query, timeout=timeout)
-
-    # Record the request
-    bot.nominatim_rate_limiter.record_request()
-
-    return result
+    return geolocator.geocode(query, timeout=timeout)
 
 
 def rate_limited_nominatim_reverse_sync(bot: Any, coordinates: str, timeout: int = 10) -> Optional[Any]:
@@ -915,17 +952,11 @@ def rate_limited_nominatim_reverse_sync(bot: Any, coordinates: str, timeout: int
         geolocator = get_nominatim_geocoder(timeout=timeout)
         return geolocator.reverse(coordinates, timeout=timeout)
 
-    # Wait for rate limiter
-    bot.nominatim_rate_limiter.wait_for_request_sync()
+    # Reserve the slot before the request, not after: this runs on worker threads.
+    bot.nominatim_rate_limiter.wait_and_request_sync()
 
-    # Make the request
     geolocator = get_nominatim_geocoder(timeout=timeout)
-    result = geolocator.reverse(coordinates, timeout=timeout)
-
-    # Record the request
-    bot.nominatim_rate_limiter.record_request()
-
-    return result
+    return geolocator.reverse(coordinates, timeout=timeout)
 
 
 async def geocode_zipcode(bot: Any, zipcode: str, default_country: Optional[str] = None, timeout: int = 10) -> tuple[Optional[float], Optional[float]]:

@@ -84,9 +84,10 @@ def test_untrusted_advert_fields_are_escaped_in_dom_interpolations(template_sour
 def test_specific_known_sinks_are_escaped(template_source: str) -> None:
     """Guard the exact sinks identified in the audit against regressions."""
     assert "${this.escapeHtml(contact.username || 'Unknown')}" in template_source
-    assert "${this.escapeHtml(s.name)}" in template_source
+    assert "String(s.name ?? '')" in template_source
     # raw advert JSON blob is HTML-escaped before landing in the <pre>
-    assert "this.escapeHtml(JSON.stringify(contact.raw_advert_data_parsed" in template_source
+    # (advert data is fetched on demand into `advertData` via /api/contact-detail)
+    assert "this.escapeHtml(JSON.stringify(advertData" in template_source
     # the raw (unescaped) forms must be gone
     assert "${contact.username || 'Unknown'}" not in template_source
     assert "`<em>${s.name}</em>`" not in template_source
@@ -239,55 +240,28 @@ def test_mesh_known_title_sinks_are_escaped(mesh_source: str) -> None:
 
 REALTIME_TEMPLATE_PATH = TEMPLATES_DIR / "realtime.html"
 
-# Free-text mesh fields (advert name, message sender, message body) that must be
-# escaped before reaching innerHTML.  Each ${...} interpolation referencing one
-# of these must go through escapeHtml(...).
-REALTIME_UNTRUSTED_TOKENS = (
-    "data.advert_name",
-    "data.sender",
-    "bodyRaw",  # message body, assigned from data.content
-)
-
-
 @pytest.fixture(scope="module")
 def realtime_source() -> str:
     assert REALTIME_TEMPLATE_PATH.is_file(), f"missing template: {REALTIME_TEMPLATE_PATH}"
     return REALTIME_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
-def test_realtime_escape_helper_exists(realtime_source: str) -> None:
-    """realtime.html must define an escapeHtml helper."""
-    assert "function escapeHtml(" in realtime_source
+def test_realtime_uses_dom_text_sinks(realtime_source: str) -> None:
+    """Untrusted packet fields must be assigned through non-parsing DOM APIs."""
+    assert "function makeElement(" in realtime_source
+    assert "element.textContent = String(text)" in realtime_source
 
 
-def test_realtime_untrusted_fields_escaped_in_interpolations(realtime_source):
-    """Every DOM interpolation of an advert name / message field is escaped."""
-    offenders = []
-    for match in INTERPOLATION_RE.finditer(realtime_source):
-        expr = match.group(1)
-        if not any(token in expr for token in REALTIME_UNTRUSTED_TOKENS):
-            continue
-        if "escapeHtml(" not in expr:
-            line_no = realtime_source.count("\n", 0, match.start()) + 1
-            offenders.append(f"line {line_no}: ${{{expr.strip()}}}")
-
-    assert not offenders, (
-        "Unescaped mesh field rendered into the live stream DOM (stored XSS):\n  "
-        + "\n  ".join(offenders)
-    )
+def test_realtime_untrusted_fields_never_reach_html_parsers(realtime_source):
+    """The live stream has no HTML parser sink for mesh-controlled values."""
+    for parser_sink in (".innerHTML", "insertAdjacentHTML", "document.write"):
+        assert parser_sink not in realtime_source
 
 
 def test_realtime_known_safe_sinks(realtime_source: str) -> None:
-    """Lock in the audited escaping of advert name, sender, body, and channel."""
-    # Advert name (the article's adv_name) -- escaped in both render paths.
-    assert "escapeHtml(data.advert_name)" in realtime_source
-    assert "<strong>Name:</strong> ${escapeHtml(name)}" in realtime_source
-    # Message sender, body, and channel badge.
-    assert "escapeHtml(data.sender || '?')" in realtime_source
-    assert "escapeHtml(bodyRaw)" in realtime_source
-    assert "escapeHtml(data.channel)" in realtime_source
-    # Raw (unescaped) forms must be absent.
-    assert "${data.advert_name}" not in realtime_source
-    assert "${data.sender}" not in realtime_source
-    assert "${data.sender || '?'}" not in realtime_source
-    assert "${bodyRaw}" not in realtime_source
+    """Lock in DOM text sinks for advert name, sender, body, and channel."""
+    assert "makeElement('strong', '', data.sender || '?')" in realtime_source
+    assert "entry.append(header, makeElement('div', 'text-break', bodyRaw))" in realtime_source
+    assert "data.channel\n            )" in realtime_source
+    assert "document.createTextNode(` ${String(data.advert_name)}" in realtime_source
+    assert "appendNodeInfo('Name', name)" in realtime_source
