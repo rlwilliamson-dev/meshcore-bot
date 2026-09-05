@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""LOCAL-ONLY tests (not upstream) for the BNA-WX-BOT customizations.
+"""LOCAL-ONLY tests (not upstream) for this deployment's customizations.
 
 Covers the URL-safe alert chunker and the scope-aware send budget.
-See /Users/ryan/wx-bot-local-mods.md.
+See the local mods notes kept outside this repo.
 """
 
 import configparser
@@ -89,7 +89,7 @@ def test_budget_is_full_on_global_flood():
 
 
 def test_budget_drops_for_regional_scope():
-    budget = _service("#us-tn-middle")._channel_body_budget()
+    budget = _service("#region-a")._channel_body_budget()
     assert budget == ALERT_CHUNK_BYTES - CHANNEL_REGIONAL_FLOOD_SCOPE_BODY_OVERHEAD
 
 
@@ -121,8 +121,8 @@ def test_inline_proactive_send_skips_user_rate_limit():
     service = _service()
     sent = _capture_sends(service)
     service._send_queue = None  # not started yet -> inline path
-    asyncio.run(service._send_to_channels(["#bna-wx", "#tn-middle"], "alert body"))
-    assert [ch for ch, _ in sent] == ["#bna-wx", "#tn-middle"]
+    asyncio.run(service._send_to_channels(["#wx-primary", "#wx-regional"], "alert body"))
+    assert [ch for ch, _ in sent] == ["#wx-primary", "#wx-regional"]
     for channel, kwargs in sent:
         assert kwargs.get("skip_user_rate_limit") is True, channel
 
@@ -137,11 +137,11 @@ def test_queued_proactive_send_skips_user_rate_limit():
         service._running = True
         service._proactive_send_warmup = 0
         service._proactive_send_gap = 0
-        await service._send_queue.put(("#bna-wx", "alert body"))
+        await service._send_queue.put(("#wx-primary", "alert body"))
         task = asyncio.create_task(service._send_drain_loop())
         await service._send_queue.join()
         task.cancel()
 
     asyncio.run(_drain_once())
-    assert sent and sent[0][0] == "#bna-wx"
+    assert sent and sent[0][0] == "#wx-primary"
     assert sent[0][1].get("skip_user_rate_limit") is True

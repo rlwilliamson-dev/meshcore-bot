@@ -44,7 +44,7 @@ def build_alert_service(monkeypatch, *, atom, last_check, seen=None):
     cfg.add_section("Weather_Service")
     cfg.set("Weather_Service", "my_position_lat", "36.16")
     cfg.set("Weather_Service", "my_position_lon", "-86.78")
-    cfg.set("Weather_Service", "alerts_channel", "bna-wx")
+    cfg.set("Weather_Service", "alerts_channel", "wx-primary")
     cfg.set("Weather_Service", "alert_zone", "TNC037")          # county -> no /points call
     cfg.set("Weather_Service", "alert_forecast_zone", "TNZ027")  # forecast zone
 
@@ -103,7 +103,7 @@ def test_first_poll_backfills_old_active_alert(monkeypatch):
         monkeypatch, atom=_atom([("FFW-1", 64)]), last_check=None)
     asyncio.run(service._check_weather_alerts())
     assert len(sent) == 1
-    assert sent[0][0] == ("bna-wx",)
+    assert sent[0][0] == ("wx-primary",)
     assert "FFW-1" in service.seen_alert_ids
     assert service.last_alert_check_time is not None  # window armed for next poll
 
